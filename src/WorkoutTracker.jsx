@@ -1,26 +1,10 @@
 import { useState, useEffect, useRef } from "react";
-import * as XLSX from "xlsx";
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from "recharts";
-
-const STORAGE_KEY = "iron-log-data";
-const AUTH_KEY = "iron-log-auth";
-
-const DEFAULT_CREDENTIALS = { username: "Asher26", password: "Hello1234" };
-
-function getCredentials() {
-  try {
-    const raw = localStorage.getItem(AUTH_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  return { ...DEFAULT_CREDENTIALS };
-}
-
-function saveCredentials(creds) {
-  try { localStorage.setItem(AUTH_KEY, JSON.stringify(creds)); } catch {}
-}
+import { db } from "./firebase";
+import { collection, doc, addDoc, setDoc, deleteDoc, onSnapshot } from "firebase/firestore";
 
 const SET_CATEGORIES = ["Warm Up Set", "Working Set"];
-const DIFFICULTIES = ["Easy", "Medium", "Difficult", "Extremely Difficult"];
+const DIFFICULTIES = ["Too Easy", "Easy", "Medium", "Difficult", "Extremely Difficult"];
 
 const DEFAULT_ROUTINES = [
   { id: "r1", name: "Push", exercises: [] },
@@ -45,6 +29,24 @@ function formatTime(seconds) {
 function uid() {
   return "_" + Math.random().toString(36).slice(2);
 }
+
+// Flatten routine exercises: expands superset blocks into individual exercises
+function flattenExercises(exercises) {
+  const result = [];
+  (exercises || []).forEach(item => {
+    if (item.type === "superset") {
+      item.exercises.forEach(ex => result.push({ ...ex, supersetId: item.id }));
+    } else {
+      result.push(item);
+    }
+  });
+  return result;
+}
+
+// Get all unique exercise names from a routine (handles supersets)
+function getExerciseNames(exercises) {
+  return flattenExercises(exercises).map(e => e.name).filter(Boolean);
+}
 function avg(arr) {
   if (!arr.length) return null;
   return arr.reduce((a, b) => a + b, 0) / arr.length;
@@ -55,37 +57,11 @@ function round1(n) {
 
 
 
-function migrateData(raw) {
-  let d = JSON.parse(raw);
-  if (d.routines && typeof d.routines[0] === "string") {
-    const nameToId = {};
-    d.routines = d.routines.map(name => {
-      const id = "r" + uid();
-      nameToId[name] = id;
-      return { id, name, exercises: [] };
-    });
-    d.sessions = (d.sessions || []).map(s => ({ ...s, routineId: nameToId[s.routine] || s.routine }));
-  }
-  d.routines = (d.routines || []).map(r => ({ exercises: [], ...r }));
-  // Ensure benchmarks array exists
-  if (!d.benchmarks) d.benchmarks = [];
-  if (!d.schedule) d.schedule = { Sun: null, Mon: null, Tue: null, Wed: null, Thu: null, Fri: null, Sat: null };
-  return d;
-}
-
 const EMPTY_DATA = {
   routines: DEFAULT_ROUTINES,
   sessions: [],
   benchmarks: [],
   schedule: { Sun: null, Mon: null, Tue: null, Wed: null, Thu: null, Fri: null, Sat: null }
-};
-
-const initialData = () => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return migrateData(raw);
-  } catch {}
-  return EMPTY_DATA;
 };
 
 function getPrevSession(sessions, routineId) {
@@ -111,49 +87,145 @@ function roundUpTo5(n) {
   return roundWeight(n);
 }
 
-// Get all historical sets for a given exercise name + set index across sessions (newest first)
+// Get all historical sets for a given exercise name + set index across sessions (newest first).
+// Collects from ALL matching exercises in a session (handles supersets where the same
+// exercise name appears multiple times — e.g. warm-up instance and working instance).
 function getSetHistory(sessions, exerciseName, setIndex) {
   const name = exerciseName.trim().toLowerCase();
   return sessions.reduce((acc, session) => {
-    const ex = session.exercises.find(e => e.name.trim().toLowerCase() === name);
-    if (!ex || !ex.sets[setIndex]) return acc;
-    const s = ex.sets[setIndex];
-    const w = parseFloat(s.weight);
-    const r = parseFloat(s.reps);
-    if (!isNaN(w) && w > 0) acc.push({ weight: w, reps: isNaN(r) ? null : r, difficulty: s.difficulty || null });
+    const matches = session.exercises.filter(e => e.name && e.name.trim().toLowerCase() === name);
+    for (const ex of matches) {
+      if (!ex.sets[setIndex]) continue;
+      const s = ex.sets[setIndex];
+      const w = parseFloat(s.weight);
+      const r = parseFloat(s.reps);
+      const hasWeight = !isNaN(w) && w > 0;
+      const hasReps = !isNaN(r) && r > 0;
+      if (hasWeight || hasReps) {
+        acc.push({ weight: hasWeight ? w : null, reps: hasReps ? r : null, difficulty: s.difficulty || null });
+        break; // take first valid match per session to avoid double-counting
+      }
+    }
     return acc;
   }, []);
 }
 
-// Suggest weight for a working set given its history and template reps.
-// Rule: weight only increases (+5 lbs) when the previous session logged
-// "Difficult" AND hit >= template reps at that weight.
-// All other cases hold or reduce weight.
+// Suggest weight for a working set — adaptive sliding-window model.
+//
+// Looks at up to 5 recent sessions for this specific set (by index).
+// Each session contributes a weighted signal based on difficulty + rep performance.
+// Recent sessions are weighted more heavily (decay factor 0.75 per step back).
+// The accumulated signal drives the size and direction of weight adjustment.
+//
+// Signal per session:
+//   Too Easy                      → +2.0  (clearly too light, progress faster)
+//   Difficult + hit template reps → +1.0  (sweet spot, ready to progress)
+//   Difficult + missed reps       → +0.2  (close but not ready)
+//   Easy / Medium                 → 0.0   (neutral — not enough stimulus signal)
+//   Extremely Difficult           → -1.5  (too heavy)
+//
+// Weighted sum thresholds → adjustment:
+//   ≥ 1.5  : +10 lbs  (strong consistent signal, e.g. multiple Too Easy)
+//   ≥ 0.8  : +5 lbs   (clear readiness)
+//   ≥ 0.3  : +2.5 lbs (mild positive trend)
+//   ≥ -0.4 : hold     (mixed or neutral)
+//   ≥ -1.0 : -5 lbs   (one bad session, likely a bad day — gentle reduction)
+//   <  -1.0: -10% (floor 5) (persistently too heavy — meaningful reduction)
 function suggestWeight(sessions, exerciseName, setIndex, templateReps) {
   const history = getSetHistory(sessions, exerciseName, setIndex);
   if (!history.length) return null;
 
-  const latest = history[0]; // newest first
-  if (!latest.difficulty) return null;
+  // Need at least one session with a difficulty rating
+  const rated = history.filter(h => h.difficulty);
+  if (!rated.length) return null;
 
+  const latest = rated[0];
   const w = latest.weight;
+  if (!w) return null;
+
   const tmplReps = parseFloat(templateReps);
-  const hitTemplateReps = !isNaN(tmplReps) && latest.reps !== null && latest.reps >= tmplReps;
+  const DECAY = 0.75; // older sessions matter less
 
-  // The only condition that triggers a weight increase:
-  // previous set was "Difficult" AND reps met the template target
-  if (latest.difficulty === "Difficult" && hitTemplateReps) return roundWeight(w + 5);
+  // Build weighted signal from up to 5 rated sessions (newest first)
+  let signal = 0;
+  let weight = 1.0;
+  for (const h of rated.slice(0, 5)) {
+    const hitReps = !isNaN(tmplReps) && h.reps !== null && h.reps >= tmplReps;
+    let s = 0;
+    if (h.difficulty === "Too Easy")            s = 2.0;
+    else if (h.difficulty === "Difficult")      s = hitReps ? 1.0 : 0.2;
+    else if (h.difficulty === "Extremely Difficult") s = -1.5;
+    // Easy / Medium contribute 0 — neutral, not a clear signal either way
+    signal += s * weight;
+    weight *= DECAY;
+  }
 
-  // Difficult but didn't hit template reps → hold weight, keep working at it
-  if (latest.difficulty === "Difficult" && !hitTemplateReps) return roundWeight(w);
+  // Map signal to adjustment
+  if (signal >= 1.5)  return roundWeight(w + 10);
+  if (signal >= 0.8)  return roundWeight(w + 5);
+  if (signal >= 0.3)  return roundWeight(w + 2.5);
+  if (signal >= -0.4) return roundWeight(w);           // hold
+  if (signal >= -1.0) return roundWeight(Math.max(5, w - 5));  // gentle drop
+  return Math.max(5, roundUpTo5(w * 0.90));            // persistent struggle → 10% drop
+}
 
-  // Too hard → reduce to give a chance to hit reps at "Difficult"
-  if (latest.difficulty === "Extremely Difficult") return Math.max(5, roundUpTo5(w * 0.75));
+// Suggest reps for a calisthenics working set — adaptive sliding-window model.
+//
+// Same signal architecture as suggestWeight but operates on reps.
+// Uses the most recent rep count as the base, then adjusts by a rep delta.
+//
+// Signal per session (same weights as suggestWeight):
+//   Too Easy                      → +2.0
+//   Difficult + hit template reps → +1.0
+//   Difficult + missed reps       → +0.2
+//   Easy / Medium                 → 0.0
+//   Extremely Difficult           → -1.5
+//
+// Signal → rep delta:
+//   ≥ 1.5  : +4 reps   (strong consistent easy signal)
+//   ≥ 0.8  : +2 reps   (clear readiness)
+//   ≥ 0.3  : +1 rep    (mild positive trend)
+//   ≥ -0.4 : hold      (neutral)
+//   ≥ -1.0 : -1 rep    (one tough session)
+//   <  -1.0: -15% (floor 1) (persistently too hard)
+function suggestCalisthenicsReps(sessions, exerciseName, setIndex, templateReps) {
+  const name = exerciseName.trim().toLowerCase();
+  const history = sessions.reduce((acc, session) => {
+    const ex = session.exercises.find(e => e.name && e.name.trim().toLowerCase() === name);
+    if (!ex || !ex.sets[setIndex]) return acc;
+    const s = ex.sets[setIndex];
+    const r = parseFloat(s.reps);
+    if (!isNaN(r) && r > 0) acc.push({ reps: r, difficulty: s.difficulty || null });
+    return acc;
+  }, []);
+  if (!history.length) return null;
 
-  // Too easy (Easy or Medium) → hold weight; these ratings mean the
-  // stimulus wasn't right, not that weight should jump — the user should
-  // reassess effort rather than auto-escalate
-  return roundWeight(w);
+  const rated = history.filter(h => h.difficulty);
+  if (!rated.length) return null;
+
+  const latest = rated[0];
+  const r = latest.reps;
+  const tmplReps = parseFloat(templateReps);
+  const DECAY = 0.75;
+
+  let signal = 0;
+  let weight = 1.0;
+  for (const h of rated.slice(0, 5)) {
+    const hitReps = !isNaN(tmplReps) && h.reps >= tmplReps;
+    let s = 0;
+    if (h.difficulty === "Too Easy")                 s = 2.0;
+    else if (h.difficulty === "Difficult")           s = hitReps ? 1.0 : 0.2;
+    else if (h.difficulty === "Extremely Difficult") s = -1.5;
+    signal += s * weight;
+    weight *= DECAY;
+  }
+
+  if (signal >= 1.5)  return r + 4;
+  if (signal >= 0.8)  return r + 2;
+  if (signal >= 0.3)  return r + 1;
+  if (signal >= -0.4) return r;
+  if (signal >= -1.0) return Math.max(1, r - 1);
+  return Math.max(1, Math.round(r * 0.85));
 }
 
 // Get the first working set weight for a given exercise in a session
@@ -211,8 +283,11 @@ function suggestWarmupWeight(sessions, exerciseName, setIndex, currentSessionExe
 
   for (const h of historyOldFirst) {
     if (!h.difficulty) continue;
-    if (h.difficulty === "Easy") {
-      // On target — nudge ratio up very slightly to not leave too much on the table
+    if (h.difficulty === "Too Easy") {
+      // Way too light — increase ratio more aggressively toward Easy
+      ratio = Math.min(ratio + 0.08, 0.75);
+    } else if (h.difficulty === "Easy") {
+      // On target — hold with tiny nudge up
       ratio = Math.min(ratio + 0.02, 0.70);
     } else if (h.difficulty === "Medium") {
       // A bit too hard — pull back
@@ -412,17 +487,14 @@ function suggestDropSet(sessions, exerciseName, currentSessionExercises, dropInd
   return { weight: roundWeight(Math.max(5, sugWeight)), reps: sugReps };
 }
 
-// For a given exercise name, collect working-set averages per session (chronological)// For a given exercise name, collect working-set averages per session (chronological)
+// For a given exercise name, collect working-set averages per session (chronological)
 function getBenchmarkHistory(sessions, exerciseName) {
   const name = exerciseName.trim().toLowerCase();
-  // sessions are stored newest-first, so reverse for chronological order
   return [...sessions].reverse().reduce((acc, session) => {
-    const ex = session.exercises.find(e => e.name.trim().toLowerCase() === name);
-    if (!ex) return acc;
-    const workingSets = ex.sets.filter(s => s.category === "Working Set");
+    const workingSets = getWorkingSetsForExercise(session, name);
     if (!workingSets.length) return acc;
-    const weights = workingSets.map(s => parseFloat(s.weight)).filter(n => !isNaN(n));
-    const reps = workingSets.map(s => parseFloat(s.reps)).filter(n => !isNaN(n));
+    const weights = workingSets.map(s => parseFloat(s.weight)).filter(n => !isNaN(n) && n > 0);
+    const reps = workingSets.map(s => parseFloat(s.reps)).filter(n => !isNaN(n) && n > 0);
     if (!weights.length && !reps.length) return acc;
     acc.push({
       date: session.date,
@@ -434,16 +506,42 @@ function getBenchmarkHistory(sessions, exerciseName) {
   }, []);
 }
 
+// Collect all working sets for an exercise name across ALL matching exercise
+// entries in a session (handles supersets where the same exercise name appears
+// multiple times with different set categories).
+function getWorkingSetsForExercise(session, name) {
+  const matches = session.exercises.filter(e => e.name && e.name.trim().toLowerCase() === name);
+  const workingSets = [];
+  for (const ex of matches) {
+    const anyCategorySet = ex.sets.some(s => s.category && s.category.trim());
+    if (anyCategorySet) {
+      for (const s of ex.sets) {
+        const cat = (s.category && s.category.trim()) || (ex.category && ex.category.trim()) || "";
+        if (cat === "Working Set") workingSets.push(s);
+      }
+    } else {
+      for (const s of ex.sets) {
+        if (parseFloat(s.weight) > 0 || parseFloat(s.reps) > 0) workingSets.push(s);
+      }
+    }
+  }
+  if (matches.length) console.log("[getWorkingSets]", name, "matches:", matches.length, "workingSets:", JSON.stringify(workingSets.map(s => ({cat: s.category, w: s.weight, r: s.reps}))));
+  return workingSets;
+}
+
 // Latest working-set averages for a given exercise name
 function getLatestWorkingSetAvg(sessions, exerciseName) {
   const name = exerciseName.trim().toLowerCase();
   for (const session of sessions) {
-    const ex = session.exercises.find(e => e.name.trim().toLowerCase() === name);
-    if (!ex) continue;
-    const workingSets = ex.sets.filter(s => s.category === "Working Set");
+    const allNames = session.exercises.map(e => e.name);
+    const hasName = session.exercises.some(e => e.name && e.name.trim().toLowerCase() === name);
+    if (hasName) console.log("[stats:session]", exerciseName, session.date, "| all ex names:", JSON.stringify(allNames), "| full exercises:", JSON.stringify(session.exercises.map(e => ({name: e.name, type: e.type, sets: e.sets ? e.sets.map(s => ({cat: s.category, w: s.weight, r: s.reps})) : "NO SETS", supersetId: e.supersetId}))));
+    const workingSets = getWorkingSetsForExercise(session, name);
     if (!workingSets.length) continue;
-    const weights = workingSets.map(s => parseFloat(s.weight)).filter(n => !isNaN(n));
-    const reps = workingSets.map(s => parseFloat(s.reps)).filter(n => !isNaN(n));
+    const weights = workingSets.map(s => parseFloat(s.weight)).filter(n => !isNaN(n) && n > 0);
+    const reps = workingSets.map(s => parseFloat(s.reps)).filter(n => !isNaN(n) && n > 0);
+    console.log("[getLatest]", name, "weights:", weights, "reps:", reps);
+    if (!weights.length && !reps.length) continue;
     return {
       date: session.date,
       weight: weights.length ? round1(avg(weights)) : null,
@@ -546,19 +644,14 @@ const initialThemeKey = () => {
   return "dark";
 };
 
-export default function App() {
-  const [data, setData] = useState(initialData);
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [loginUsername, setLoginUsername] = useState("");
-  const [loginPassword, setLoginPassword] = useState("");
-  const [loginError, setLoginError] = useState("");
+export default function WorkoutTracker({ user }) {
+  const [loading, setLoading] = useState(true);
+  
+  const [Workouts, setWorkouts] = useState([]);
+  const [data, setData] = useState(EMPTY_DATA);
   const [themeKey, setThemeKey] = useState(initialThemeKey);
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsTab, setSettingsTab] = useState("theme"); // "theme" | "account"
-  const [newUsername, setNewUsername] = useState("");
-  const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [accountMsg, setAccountMsg] = useState("");
+
   const theme = THEMES[themeKey] || THEMES.dark;
   const [view, setView] = useState("home");
   const [editingRoutine, setEditingRoutine] = useState(null);
@@ -570,7 +663,12 @@ export default function App() {
   const [renamingId, setRenamingId] = useState(null);
   const [renameValue, setRenameValue] = useState("");
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
+  const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
+  const [sessionStartTime, setSessionStartTime] = useState(null);
+  const [sessionElapsed, setSessionElapsed] = useState(0);
+  const sessionTimerRef = useRef(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState(null);
+  const [deleteRoutineConfirmId, setDeleteRoutineConfirmId] = useState(null);
   const [pendingNav, setPendingNav] = useState(null);
   const [restRunning, setRestRunning] = useState(false);
   const [restElapsed, setRestElapsed] = useState(0);
@@ -584,11 +682,87 @@ export default function App() {
   const [setDraft, setSetDraft] = useState({}); // draft values while modal open
   const [notesModal, setNotesModal] = useState(null); // { context: "tmpl"|"log", exId, si, value }
   const [notesDraft, setNotesDraft] = useState("");
-  const timerRef = useRef(null);
-
+    // Restore session timer if page was reloaded mid-session
   useEffect(() => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
-  }, [data]);
+    try {
+      const saved = localStorage.getItem("iron-log-session-start");
+      if (saved) {
+        const t = parseInt(saved);
+        if (!isNaN(t) && Date.now() - t < 14400000) {
+          setSessionStartTime(t);
+        } else {
+          localStorage.removeItem("iron-log-session-start");
+        }
+      }
+    } catch(e) {}
+  }, []);
+
+  const timerRef = useRef(null);
+  useEffect(() => {
+  if (!user) return
+
+  // Load SheetJS for Excel export
+  if (!window.XLSX) {
+    const script = document.createElement("script")
+    script.src =
+      "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"
+    document.head.appendChild(script)
+  }
+
+  const unsubSessions = onSnapshot(
+    collection(db, "users", user.uid, "workouts"),
+    (snapshot) => {
+      const sessions = snapshot.docs.map((d) => ({
+        ...d.data(),
+        _fsId: d.id,
+      }))
+
+      sessions.sort((a, b) => new Date(b.date) - new Date(a.date))
+
+      setData((prev) => ({ ...prev, sessions }))
+    }
+  )
+
+  const unsubUserData = onSnapshot(doc(db, "userdata", user.uid), (docSnap) => {
+    if (docSnap.exists()) {
+      const d = docSnap.data()
+      setData((prev) => ({
+        ...prev,
+        routines: d.routines || DEFAULT_ROUTINES,
+        benchmarks: d.benchmarks || [],
+        schedule:
+          d.schedule || {
+            Sun: null,
+            Mon: null,
+            Tue: null,
+            Wed: null,
+            Thu: null,
+            Fri: null,
+            Sat: null,
+          },
+      }))
+    } else {
+      setDoc(doc(db, "userdata", user.uid), {
+        routines: DEFAULT_ROUTINES,
+        benchmarks: [],
+        schedule: {
+          Sun: null,
+          Mon: null,
+          Tue: null,
+          Wed: null,
+          Thu: null,
+          Fri: null,
+          Sat: null,
+        },
+      })
+    }
+  })
+
+  return () => {
+    unsubSessions()
+    unsubUserData()
+  }
+}, [user])
 
   useEffect(() => {
     if (restRunning) {
@@ -601,18 +775,27 @@ export default function App() {
     return () => clearInterval(timerRef.current);
   }, [restRunning]);
 
+  // Session-level elapsed timer (persists across view changes)
+  useEffect(() => {
+    if (sessionStartTime) {
+      sessionTimerRef.current = setInterval(() => {
+        setSessionElapsed(Math.floor((Date.now() - sessionStartTime) / 1000));
+      }, 1000);
+    } else {
+      clearInterval(sessionTimerRef.current);
+      setSessionElapsed(0);
+    }
+    return () => clearInterval(sessionTimerRef.current);
+  }, [sessionStartTime]);
+
   function getRoutineName(routineId) {
     const r = data.routines.find(r => r.id === routineId);
     return r ? r.name : routineId;
   }
 
   function safeNav(target) {
-    if (currentSession) {
-      setPendingNav(target);
-      setShowDiscardConfirm(true);
-    } else {
-      setView(target);
-    }
+    // Session stays alive in background — just navigate freely
+    setView(target);
   }
 
   function discardSession() {
@@ -620,6 +803,9 @@ export default function App() {
     setRestRunning(false);
     setRestElapsed(0);
     setShowDiscardConfirm(false);
+    setShowCompleteConfirm(false);
+    setSessionStartTime(null);
+    try { localStorage.removeItem("iron-log-session-start"); } catch(e) {}
     setView(pendingNav || "home");
     setPendingNav(null);
   }
@@ -631,16 +817,38 @@ export default function App() {
     setView("editRoutine");
   }
 
+  function sanitizeForFirestore(obj) {
+    return JSON.parse(JSON.stringify(obj, (key, val) => val === undefined ? null : val));
+  }
+
   function saveRoutineTemplate() {
-    setData(d => ({ ...d, routines: d.routines.map(r => r.id === editingRoutine.id ? editingRoutine : r) }));
+    const updated = data.routines.map(r => r.id === editingRoutine.id ? editingRoutine : r);
+    setData(d => ({ ...d, routines: updated }));
+    if (user) setDoc(doc(db, "userdata", user.uid), { routines: sanitizeForFirestore(updated) }, { merge: true });
     setEditingRoutine(null);
-    setView("home");
+    setView("routines");
   }
 
   function tmplAddExercise() {
     setEditingRoutine(r => ({
       ...r,
-      exercises: [...r.exercises, { id: uid(), name: "", category: "Working Set", allowDropSets: true, sets: [{ reps: "", rest: "", notes: "", category: "Working Set" }] }]
+      exercises: [...r.exercises, { id: uid(), name: "", category: "Working Set", allowDropSets: true, calisthenics: false, sets: [{ reps: "", rest: "", notes: "", category: "Working Set" }] }]
+    }));
+  }
+
+  function tmplToggleCalisthenics(exId) {
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e => e.id === exId ? { ...e, calisthenics: !e.calisthenics } : e)
+    }));
+  }
+
+  function tmplToggleSsCalisthenics(ssId, exId) {
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e =>
+        e.id === ssId ? { ...e, exercises: e.exercises.map(ex => ex.id === exId ? { ...ex, calisthenics: !ex.calisthenics } : ex) } : e
+      )
     }));
   }
 
@@ -697,16 +905,130 @@ export default function App() {
     }));
   }
 
+  // ── SUPERSET TEMPLATE EDITING ───────────────────────────────────────────
+
+  function tmplAddSuperset() {
+    const ex1 = { id: uid(), name: "", category: "Working Set", allowDropSets: true, calisthenics: false, sets: [{ reps: "", rest: "", notes: "", category: "Working Set" }] };
+    const ex2 = { id: uid(), name: "", category: "Working Set", allowDropSets: true, calisthenics: false, sets: [{ reps: "", rest: "", notes: "", category: "Working Set" }] };
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: [...r.exercises, { id: uid(), type: "superset", exercises: [ex1, ex2] }]
+    }));
+  }
+
+  function tmplAddExToSuperset(ssId) {
+    const newEx = { id: uid(), name: "", category: "Working Set", allowDropSets: true, calisthenics: false, sets: [{ reps: "", rest: "", notes: "", category: "Working Set" }] };
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e => e.id === ssId ? { ...e, exercises: [...e.exercises, newEx] } : e)
+    }));
+  }
+
+  function tmplRemoveSuperset(ssId) {
+    setEditingRoutine(r => ({ ...r, exercises: r.exercises.filter(e => e.id !== ssId) }));
+  }
+
+  function tmplRemoveExFromSuperset(ssId, exId) {
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e => {
+        if (e.id !== ssId) return e;
+        const remaining = e.exercises.filter(ex => ex.id !== exId);
+        // If only 1 exercise left, dissolve superset back to single exercise
+        if (remaining.length === 1) return remaining[0];
+        return { ...e, exercises: remaining };
+      })
+    }));
+  }
+
+  function tmplUpdateSsExName(ssId, exId, name) {
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e =>
+        e.id === ssId ? { ...e, exercises: e.exercises.map(ex => ex.id === exId ? { ...ex, name } : ex) } : e
+      )
+    }));
+  }
+
+  function tmplToggleSsDropSets(ssId, exId) {
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e =>
+        e.id === ssId ? { ...e, exercises: e.exercises.map(ex => ex.id === exId ? { ...ex, allowDropSets: !ex.allowDropSets } : ex) } : e
+      )
+    }));
+  }
+
+  function tmplAddSsSet(ssId, exId) {
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e =>
+        e.id === ssId ? {
+          ...e,
+          exercises: e.exercises.map(ex =>
+            ex.id === exId ? { ...ex, sets: [...ex.sets, { reps: "", rest: "", notes: "", category: ex.category || "Working Set" }] } : ex
+          )
+        } : e
+      )
+    }));
+  }
+
+  function tmplUpdateSsSet(ssId, exId, si, field, value) {
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e =>
+        e.id === ssId ? {
+          ...e,
+          exercises: e.exercises.map(ex =>
+            ex.id === exId ? { ...ex, sets: ex.sets.map((s, i) => i === si ? { ...s, [field]: value } : s) } : ex
+          )
+        } : e
+      )
+    }));
+  }
+
+  function tmplRemoveSsSet(ssId, exId, si) {
+    setEditingRoutine(r => ({
+      ...r,
+      exercises: r.exercises.map(e =>
+        e.id === ssId ? {
+          ...e,
+          exercises: e.exercises.map(ex =>
+            ex.id === exId ? { ...ex, sets: ex.sets.filter((_, i) => i !== si) } : ex
+          )
+        } : e
+      )
+    }));
+  }
+
   // ── SESSION LOGGING ──────────────────────────────────────────────────────
 
   function startSession(routine) {
-    const exercises = routine.exercises.map(e => ({
-      ...e,
-      id: uid(),
-      sets: e.sets.map(s => ({ ...s, weight: "" }))
-    }));
+    const exercises = [];
+    routine.exercises.forEach(e => {
+      if (e.type === "superset") {
+        const ssId = e.id; // shared group id for all exercises in this superset
+        e.exercises.forEach(ex => {
+          exercises.push({
+            ...ex,
+            id: uid(),
+            supersetId: ssId,
+            sets: ex.sets.map(s => ({ ...s, weight: "", instruction: s.notes || "", notes: "" }))
+          });
+        });
+      } else {
+        exercises.push({
+          ...e,
+          id: uid(),
+          sets: e.sets.map(s => ({ ...s, weight: "", instruction: s.notes || "", notes: "" }))
+        });
+      }
+    });
     setActiveRoutine(routine);
+    const now = Date.now();
     setCurrentSession({ routineId: routine.id, date: new Date().toISOString(), exercises });
+    setSessionStartTime(now);
+    try { localStorage.setItem("iron-log-session-start", String(now)); } catch(e) {}
     setView("log");
   }
 
@@ -837,13 +1159,21 @@ export default function App() {
   }
 
   function completeSession() {
-    const session = { ...currentSession, id: Date.now() };
-    setData(d => ({ ...d, sessions: [session, ...d.sessions] }));
+    const duration = sessionStartTime ? Math.floor((Date.now() - sessionStartTime) / 1000) : 0;
+    const session = { ...currentSession, id: Date.now(), duration };
+    addDoc(collection(db,"users", user.uid, "workouts"), sanitizeForFirestore(session));
     setCurrentSession(null);
     setRestRunning(false);
     setRestElapsed(0);
     setShowDiscardConfirm(false);
+    setShowCompleteConfirm(false);
+    setSessionStartTime(null);
+    try { localStorage.removeItem("iron-log-session-start"); } catch(e) {}
     setView("home");
+  }
+
+  function confirmCompleteSession() {
+    setShowCompleteConfirm(true);
   }
 
   function startRestTimer() {
@@ -864,7 +1194,10 @@ export default function App() {
   }
 
   function deleteSession(id) {
-    setData(d => ({ ...d, sessions: d.sessions.filter(s => s.id !== id) }));
+    const session = data.sessions.find(s => s.id === id);
+    if (session && session._fsId) {
+      if (user) deleteDoc(doc(db, "users", user.uid, "workouts", session._fsId));
+    }
     setDeleteConfirmId(null);
     if (view === "session") setView("history");
   }
@@ -874,66 +1207,38 @@ export default function App() {
   function addRoutine() {
     const name = newRoutineName.trim();
     if (!name || data.routines.find(r => r.name === name)) return;
-    setData(d => ({ ...d, routines: [...d.routines, { id: "r" + uid(), name, exercises: [] }] }));
+    const newRoutine = { id: "r" + uid(), name, exercises: [] };
+    const updated = [...data.routines, newRoutine];
+    setData(d => ({ ...d, routines: updated }));
+    if (user) setDoc(doc(db, "userdata", user.uid), { routines: sanitizeForFirestore(updated) }, { merge: true });
     setNewRoutineName("");
     setShowAddRoutine(false);
   }
 
   function confirmRename(id) {
     const name = renameValue.trim();
-    if (!name || data.routines.find(r => r.name === name && r.id !== id)) { setRenamingId(null); return; }
-    setData(d => ({ ...d, routines: d.routines.map(r => r.id === id ? { ...r, name } : r) }));
+    if (!name || data.routines.find(r => r.name === name && r.id !== id)) {
+      setRenamingId(null);
+      return;
+    }
+    const updated = data.routines.map(r => r.id === id ? { ...r, name } : r);
+    setData(d => ({ ...d, routines: updated }));
+    if (user) setDoc(doc(db, "userdata", user.uid), { routines: sanitizeForFirestore(updated) }, { merge: true });
     setRenamingId(null);
+    setRenameValue("");
   }
+
+  function deleteRoutine(id) {
+    const updated = data.routines.filter(r => r.id !== id);
+    setData(d => ({ ...d, routines: updated }));
+    if (user) setDoc(doc(db, "userdata", user.uid), { routines: sanitizeForFirestore(updated) }, { merge: true });
+  }
+
+
 
   function setThemePreset(key) {
     setThemeKey(key);
     try { localStorage.setItem(THEME_STORAGE_KEY, key); } catch {}
-  }
-
-  // ── AUTH ─────────────────────────────────────────────────────────────────
-
-  function handleLogin() {
-    const creds = getCredentials();
-    if (loginUsername === creds.username && loginPassword === creds.password) {
-      setIsLoggedIn(true);
-      setLoginError("");
-      setLoginUsername("");
-      setLoginPassword("");
-    } else {
-      setLoginError("Incorrect username or password.");
-    }
-  }
-
-  function handleLogout() {
-    setIsLoggedIn(false);
-    setShowSettings(false);
-  }
-
-  function handleSaveAccount() {
-    const creds = getCredentials();
-    const updatedCreds = { ...creds };
-    let changed = false;
-
-    if (newUsername.trim() && newUsername.trim() !== creds.username) {
-      updatedCreds.username = newUsername.trim();
-      changed = true;
-    }
-    if (newPassword) {
-      if (newPassword !== confirmPassword) {
-        setAccountMsg("Passwords do not match.");
-        return;
-      }
-      updatedCreds.password = newPassword;
-      changed = true;
-    }
-    if (!changed) { setAccountMsg("No changes made."); return; }
-    saveCredentials(updatedCreds);
-    setNewUsername("");
-    setNewPassword("");
-    setConfirmPassword("");
-    setAccountMsg("Saved successfully.");
-    setTimeout(() => setAccountMsg(""), 3000);
   }
 
   // ── MANUAL SESSION ENTRY ────────────────────────────────────────────────
@@ -945,7 +1250,7 @@ export default function App() {
 
   function meSetRoutine(routineId) {
     const routine = data.routines.find(r => r.id === routineId);
-    const exercises = routine ? routine.exercises.map(e => ({
+    const exercises = routine ? flattenExercises(routine.exercises).map(e => ({
       id: uid(), name: e.name,
       sets: []
     })) : [];
@@ -1032,7 +1337,7 @@ export default function App() {
         sets: ex.sets.map(s => ({ ...s, rest: "" }))
       }))
     };
-    setData(d => ({ ...d, sessions: [session, ...d.sessions].sort((a, b) => new Date(b.date) - new Date(a.date)) }));
+    addDoc(collection(db,"users", user.uid, "workouts"), sanitizeForFirestore(session));
     setManualEntry(null);
     setView("history");
   }
@@ -1040,6 +1345,8 @@ export default function App() {
   // ── EXPORT ──────────────────────────────────────────────────────────────
 
   function exportToExcel() {
+    const XLSX = window.XLSX;
+    if (!XLSX) { alert("Export not ready. Please wait a moment and try again."); return; }
     const wb = XLSX.utils.book_new();
 
     // Sort sessions oldest first for the workbook
@@ -1085,7 +1392,9 @@ export default function App() {
   // ── BENCHMARKS ───────────────────────────────────────────────────────────
 
   function removeBenchmark(name) {
-    setData(d => ({ ...d, benchmarks: d.benchmarks.filter(b => b !== name) }));
+    const updated = data.benchmarks.filter(b => b !== name);
+    setData(d => ({ ...d, benchmarks: updated }));
+    if (user) setDoc(doc(db, "userdata", user.uid), { benchmarks: updated }, { merge: true });
     if (activeBenchmark === name) setActiveBenchmark(null);
   }
 
@@ -1095,46 +1404,15 @@ export default function App() {
   const CHART_WEIGHT_COLOR = theme.benchmarkStat;
   const CHART_REPS_COLOR = theme.workingTarget;
 
-  const T = theme; // convenience alias
+  // All known exercise names from saved data only (not editingRoutine — that changes per keystroke)
+  const knownExNames = [...new Set(
+    data.routines.flatMap(r => getExerciseNames(r.exercises))
+      .concat(data.sessions.flatMap(s => s.exercises.map(e => e.name || "")))
+      .map(n => (n || "").trim())
+      .filter(n => n.length > 0)
+  )].sort();
 
-  if (!isLoggedIn) {
-    return (
-      <div style={{...S.app, background: theme.app, color: theme.primaryText, display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh"}}>
-        <div style={{...S.loginBox, background: theme.surface, borderColor: theme.border}}>
-          <div style={{textAlign: "center", marginBottom: 28}}>
-            <span style={{fontSize: 28, color: T.accent}}>⬡</span>
-            <div style={{...S.logoText, color: theme.primaryText, fontSize: 16, letterSpacing: "0.2em", marginTop: 8}}>IRON LOG</div>
-          </div>
-          <div style={S.setModalField}>
-            <label style={{...S.setModalLabel, color: theme.mutedText}}>USERNAME</label>
-            <input
-              style={{...S.setModalInput, background: theme.inputBg, borderColor: loginError ? theme.dangerText : theme.border, color: theme.primaryText, fontSize: 16, padding: "12px 14px"}}
-              placeholder="Username"
-              value={loginUsername}
-              onChange={e => { setLoginUsername(e.target.value); setLoginError(""); }}
-              onKeyDown={e => e.key === "Enter" && handleLogin()}
-              autoFocus
-            />
-          </div>
-          <div style={S.setModalField}>
-            <label style={{...S.setModalLabel, color: theme.mutedText}}>PASSWORD</label>
-            <input
-              type="password"
-              style={{...S.setModalInput, background: theme.inputBg, borderColor: loginError ? theme.dangerText : theme.border, color: theme.primaryText, fontSize: 16, padding: "12px 14px"}}
-              placeholder="Password"
-              value={loginPassword}
-              onChange={e => { setLoginPassword(e.target.value); setLoginError(""); }}
-              onKeyDown={e => e.key === "Enter" && handleLogin()}
-            />
-          </div>
-          {loginError && <div style={{fontSize: 12, color: theme.dangerText, marginBottom: 12, textAlign: "center"}}>{loginError}</div>}
-          <button style={{...S.completeBtn, background: T.accent, color: theme.app, width: "100%", padding: 14, fontSize: 14}} onClick={handleLogin}>
-            Sign In
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const T = theme; // convenience alias
 
   return (
     <div style={{...S.app, background: theme.app, color: theme.primaryText}}>
@@ -1157,6 +1435,17 @@ export default function App() {
       </header>
 
       <main style={S.main}>
+
+        {/* ── ACTIVE SESSION BANNER ── */}
+        {currentSession && view !== "log" && (
+          <div style={{background: theme.accentDim, border: "1px solid " + T.accentBorder, borderRadius: 10, padding: "12px 16px", marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center"}}>
+            <div>
+              <span style={{fontSize: 10, color: T.accent, fontWeight: 700, letterSpacing: "0.12em"}}>SESSION IN PROGRESS</span>
+              <div style={{fontSize: 13, color: theme.primaryText, fontWeight: 700, marginTop: 2}}>{activeRoutine && activeRoutine.name} — {formatTime(sessionElapsed)}</div>
+            </div>
+            <button style={{...S.completeBtn, background: T.accent, color: theme.app}} onClick={() => setView("log")}>Resume ▶</button>
+          </div>
+        )}
 
         {/* ── HOME ── */}
         {view === "home" && (() => { const todayKey = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()]; const todayRoutineId = data.schedule && data.schedule[todayKey] || null; const todayRoutine = todayRoutineId && todayRoutineId !== "rest" ? data.routines.find(r => r.id === todayRoutineId) : null; const isTodayRest = todayRoutineId === "rest"; return (
@@ -1224,12 +1513,20 @@ export default function App() {
                       <button style={{...S.routinePlayBtn, color: theme.primaryText}} onClick={() => startSession(r)}>
                         <span style={S.routineIcon}>▶</span>
                         <span style={{...S.routineName, color: theme.primaryText}}>{r.name}</span>
-                        <span style={{...S.routineCount, color: theme.mutedText}}>{r.exercises.length} exercise{r.exercises.length !== 1 ? "s" : ""}</span>
+                        <span style={{...S.routineCount, color: theme.mutedText}}>{flattenExercises(r.exercises).length} exercise{flattenExercises(r.exercises).length !== 1 ? "s" : ""}</span>
                       </button>
-                      <div style={{...S.routineActions, borderColor: theme.borderSubtle}}>
-                        <button style={{...S.routineActionBtn, color: theme.mutedText, borderColor: theme.borderSubtle}} onClick={() => openEditRoutine(r)}>Edit</button>
-                        <button style={{...S.routineActionBtn, borderRight: "none", color: theme.mutedText}} onClick={() => { setRenamingId(r.id); setRenameValue(r.name); }}>Rename</button>
-                      </div>
+                      {(() => {
+                        const inHistory = data.sessions.some(s => s.routineId === r.id);
+                        return (
+                          <div style={{...S.routineActions, borderColor: theme.borderSubtle}}>
+                            <button style={{...S.routineActionBtn, color: theme.mutedText, borderColor: theme.borderSubtle}} onClick={() => openEditRoutine(r)}>Edit</button>
+                            <button style={{...S.routineActionBtn, color: theme.mutedText, borderColor: theme.borderSubtle}} onClick={() => { setRenamingId(r.id); setRenameValue(r.name); }}>Rename</button>
+                            {!inHistory && (
+                              <button style={{...S.routineActionBtn, borderRight: "none", color: theme.dangerText}} onClick={() => setDeleteRoutineConfirmId(r.id)}>Delete</button>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </div>
                   )}
                 </div>
@@ -1256,61 +1553,176 @@ export default function App() {
             <button style={{...S.backBtn, color: theme.mutedText}} onClick={() => setView("routines")}>← Back</button>
             <div style={{...S.heroLabel, color: T.accent}}>ROUTINE TEMPLATE</div>
             <h2 style={{...S.logTitle, color: theme.primaryText}}>{editingRoutine.name}</h2>
-            <p style={{...S.templateHint, color: theme.mutedText}}>Define exercises and default sets. Set the category for each individual set.</p>
+            <p style={{...S.templateHint, color: theme.mutedText}}>Define exercises and default sets.</p>
 
             {editingRoutine.exercises.length === 0 && (
               <div style={{...S.emptyTemplate, color: theme.mutedText}}>No exercises yet — add one below.</div>
             )}
 
-            {editingRoutine.exercises.map((ex, ei) => (
-              <div key={ex.id} style={{...S.exerciseCard, background: theme.surface, borderColor: theme.borderSubtle}}>
-                <div style={S.exHeader}>
-                  <span style={{...S.exNum, color: T.accent}}>#{ei + 1}</span>
-                  <input style={{...S.exNameInput, color: theme.primaryText, borderColor: theme.border, background: "transparent"}} placeholder="Exercise name..."
-                    value={ex.name} onChange={e => tmplUpdateExName(ex.id, e.target.value)} />
-                  <div style={S.exMoveGroup}>
-                    <button style={{...S.moveBtn, color: theme.mutedText, background: theme.surfaceAlt}} onClick={() => tmplMoveExercise(ex.id, -1)} disabled={ei === 0}>↑</button>
-                    <button style={{...S.moveBtn, color: theme.mutedText, background: theme.surfaceAlt}} onClick={() => tmplMoveExercise(ex.id, 1)} disabled={ei === editingRoutine.exercises.length - 1}>↓</button>
+            {editingRoutine.exercises.map((item, ei) => {
+              if (item.type === "superset") {
+                return (
+                  <div key={item.id} style={{border: "1px solid " + T.accentBorder, borderRadius: 12, marginBottom: 16, overflow: "hidden"}}>
+                    <div style={{background: theme.accentDim, padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between"}}>
+                      <div style={{display: "flex", alignItems: "center", gap: 8}}>
+                        <span style={{...S.exNum, color: T.accent}}>#{ei + 1}</span>
+                        <span style={{fontSize: 11, color: T.accent, fontWeight: 700, letterSpacing: "0.1em"}}>SUPERSET</span>
+                        <span style={{fontSize: 10, color: theme.primaryText, fontWeight: 700}}>{item.exercises.length} exercises</span>
+                      </div>
+                      <div style={{display: "flex", gap: 6}}>
+                        <button style={{...S.moveBtn, color: theme.mutedText, background: theme.surfaceAlt}} onClick={() => tmplMoveExercise(item.id, -1)} disabled={ei === 0}>↑</button>
+                        <button style={{...S.moveBtn, color: theme.mutedText, background: theme.surfaceAlt}} onClick={() => tmplMoveExercise(item.id, 1)} disabled={ei === editingRoutine.exercises.length - 1}>↓</button>
+                        <button style={{...S.removeBtn, color: theme.mutedText}} onClick={() => tmplRemoveSuperset(item.id)}>✕</button>
+                      </div>
+                    </div>
+                    <div style={{padding: "12px 12px 4px"}}>
+                      {item.exercises.map((ex, xi) => (
+                        <div key={ex.id} style={{...S.exerciseCard, background: theme.surfaceAlt, borderColor: T.accentBorder + "66", marginBottom: 8}}>
+                          <div style={S.exHeader}>
+                            <span style={{fontSize: 10, color: T.accent, fontWeight: 700, minWidth: 28}}>{String.fromCharCode(65 + xi)}</span>
+                            <div style={{flex: 1, display: "flex", flexDirection: "column", gap: 4}}>
+                              <select
+                                style={{...S.setCatSelectSmall, background: theme.inputBg, borderColor: theme.border, color: ex.name ? theme.primaryText : theme.mutedText, fontWeight: 600, width: "100%"}}
+                                value={ex.name}
+                                onChange={e => tmplUpdateSsExName(item.id, ex.id, e.target.value)}
+                              >
+                                <option value="">— Select exercise —</option>
+                                {knownExNames.map(n => <option key={n} value={n}>{n}</option>)}
+                              </select>
+                              <input
+                                key={"ss-name-" + ex.id}
+                                style={{...S.exNameInput, color: theme.primaryText, borderColor: theme.border, background: "transparent", width: "100%"}}
+                                placeholder="Or type a new name..."
+                                value={ex.name}
+                                onChange={e => tmplUpdateSsExName(item.id, ex.id, e.target.value)}
+                              />
+                            </div>
+                            <button style={{...S.moveBtn, color: theme.mutedText, background: theme.surfaceAlt, fontSize: 10, padding: "2px 6px"}} title="Duplicate" onClick={() => {
+                              const copy = JSON.parse(JSON.stringify(ex));
+                              copy.id = uid();
+                              setEditingRoutine(r => ({ ...r, exercises: r.exercises.map(it => it.id === item.id ? { ...it, exercises: [...it.exercises, copy] } : it) }));
+                            }}>⧉</button>
+                            {item.exercises.length > 2 && (
+                              <button style={{...S.removeBtn, color: theme.mutedText}} onClick={() => tmplRemoveExFromSuperset(item.id, ex.id)}>✕</button>
+                            )}
+                          </div>
+                          <label style={S.dropSetToggleRow}>
+                            <input type="checkbox" checked={ex.allowDropSets !== false} onChange={() => tmplToggleSsDropSets(item.id, ex.id)} style={S.dropSetCheckbox} />
+                            <span style={{...S.dropSetToggleLabel, color: theme.primaryText, fontWeight: 700}}>Allow drop sets</span>
+                          </label>
+                          <label style={S.dropSetToggleRow}>
+                            <input type="checkbox" checked={ex.calisthenics === true} onChange={() => tmplToggleSsCalisthenics(item.id, ex.id)} style={S.dropSetCheckbox} />
+                            <span style={{...S.dropSetToggleLabel, color: theme.primaryText, fontWeight: 700}}>Calisthenics (reps only)</span>
+                          </label>
+                          <div style={S.setHeaderRowTemplate}>
+                            <span style={{...S.setHeaderCell, color: theme.mutedText}}>Set</span>
+                            <span style={{...S.setHeaderCell, color: theme.mutedText}}>Category</span>
+                            <span style={{...S.setHeaderCell, color: theme.mutedText}}>Reps</span>
+                            <span style={{...S.setHeaderCell, color: theme.mutedText}}>Rest</span>
+                            <span style={{...S.setHeaderCell, color: theme.mutedText}}>Notes</span>
+                            <span style={{...S.setHeaderCell, color: theme.mutedText}}></span>
+                          </div>
+                          {ex.sets.map((set, si) => (
+                            <div key={si}>
+                              <div style={S.setRowTemplate}>
+                                <span style={{...S.setNum, color: theme.mutedText}}>{si + 1}</span>
+                                <select style={{...S.setCatSelectSmall, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText, fontWeight: 600}} value={set.category || "Working Set"} onChange={e => tmplUpdateSsSet(item.id, ex.id, si, "category", e.target.value)}>
+                                  {SET_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                                </select>
+                                <input style={{...S.setInput, background: theme.inputBg, borderColor: theme.inputBorder, color: theme.primaryText, fontWeight: 600}} placeholder="—" value={set.reps} onChange={e => tmplUpdateSsSet(item.id, ex.id, si, "reps", e.target.value)} inputMode="numeric" />
+                                <input style={{...S.setInput, background: theme.inputBg, borderColor: theme.inputBorder, color: theme.primaryText, fontWeight: 600}} placeholder="—" value={set.rest} onChange={e => tmplUpdateSsSet(item.id, ex.id, si, "rest", e.target.value)} />
+                                <button style={set.notes ? {...S.notesBtnFilled, color: T.accent, background: theme.accentDim, borderColor: T.accentBorder} : {...S.notesBtn, color: theme.primaryText, background: theme.surface, borderColor: theme.border}} onClick={() => { setNotesModal({ context: "tmpl", exId: ex.id, ssId: item.id, si }); setNotesDraft(set.notes || ""); }}>{set.notes ? "📝" : "+"} Notes</button>
+                                <button style={{...S.removeSetBtn, color: theme.mutedText}} onClick={() => tmplRemoveSsSet(item.id, ex.id, si)}>–</button>
+                              </div>
+                              {set.notes ? <div style={{fontSize: 11, color: theme.mutedText, padding: "2px 8px 6px", fontStyle: "italic"}}>{set.notes}</div> : null}
+                            </div>
+                          ))}
+                          <button style={{...S.addSetBtn, color: theme.mutedText}} onClick={() => tmplAddSsSet(item.id, ex.id)}>+ Add Set</button>
+                        </div>
+                      ))}
+                      <button style={{...S.addSetBtn, color: T.accent, marginBottom: 8}} onClick={() => tmplAddExToSuperset(item.id)}>+ Add Exercise to Superset</button>
+                    </div>
                   </div>
-                  <button style={{...S.removeBtn, color: theme.mutedText}} onClick={() => tmplRemoveExercise(ex.id)}>✕</button>
-                </div>
+                );
+              }
 
-                <label style={S.dropSetToggleRow}>
-                  <input
-                    type="checkbox"
-                    checked={ex.allowDropSets !== false}
-                    onChange={() => tmplToggleDropSets(ex.id)}
-                    style={S.dropSetCheckbox}
-                  />
-                  <span style={{...S.dropSetToggleLabel, color: theme.mutedText}}>Allow drop sets</span>
-                </label>
-
-                <div style={S.setHeaderRowTemplate}>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Set</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>CATEGORY</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Reps</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Rest</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Notes</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}></span>
-                </div>
-
-                {ex.sets.map((set, si) => (
-                  <div key={si} style={S.setRowTemplate}>
-                    <span style={{...S.setNum, color: theme.mutedText}}>{si + 1}</span>
-                    <select style={{...S.setCatSelectSmall, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText, fontWeight: 600}} value={set.category || "Working Set"} onChange={e => tmplUpdateSet(ex.id, si, "category", e.target.value)}>
-                      {SET_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
-                    </select>
-                    <input style={{...S.setInput, background: theme.inputBg, borderColor: theme.inputBorder, color: theme.primaryText, fontWeight: 600}} placeholder="—" value={set.reps} onChange={e => tmplUpdateSet(ex.id, si, "reps", e.target.value)} inputMode="numeric" />
-                    <input style={{...S.setInput, background: theme.inputBg, borderColor: theme.inputBorder, color: theme.primaryText, fontWeight: 600}} placeholder="—" value={set.rest} onChange={e => tmplUpdateSet(ex.id, si, "rest", e.target.value)} />
-                    <button style={set.notes ? {...S.notesBtnFilled, color: T.accent, background: theme.accentDim, borderColor: T.accentBorder} : {...S.notesBtn, color: theme.primaryText, background: theme.surface, borderColor: theme.border}} onClick={() => { setNotesModal({ context: "tmpl", exId: ex.id, si }); setNotesDraft(set.notes || ""); }}>{set.notes ? "📝" : "+"} Notes</button>
-                    <button style={{...S.removeSetBtn, color: theme.mutedText}} onClick={() => tmplRemoveSet(ex.id, si)}>–</button>
+              return (
+                <div key={item.id} style={{...S.exerciseCard, background: theme.surface, borderColor: theme.borderSubtle}}>
+                  <div style={S.exHeader}>
+                    <span style={{...S.exNum, color: T.accent}}>#{ei + 1}</span>
+                    <div style={{flex: 1, display: "flex", flexDirection: "column", gap: 4}}>
+                      <select
+                        style={{...S.setCatSelectSmall, background: theme.inputBg, borderColor: theme.border, color: item.name ? theme.primaryText : theme.mutedText, fontWeight: 600, width: "100%"}}
+                        value={item.name}
+                        onChange={e => tmplUpdateExName(item.id, e.target.value)}
+                      >
+                        <option value="">— Select exercise —</option>
+                        {knownExNames.map(n => <option key={n} value={n}>{n}</option>)}
+                      </select>
+                      <input
+                        key={"ex-name-" + item.id}
+                        style={{...S.exNameInput, color: theme.primaryText, borderColor: theme.border, background: "transparent", width: "100%"}}
+                        placeholder="Or type a new name..."
+                        value={item.name}
+                        onChange={e => tmplUpdateExName(item.id, e.target.value)}
+                      />
+                    </div>
+                    <div style={S.exMoveGroup}>
+                      <button style={{...S.moveBtn, color: theme.mutedText, background: theme.surfaceAlt}} onClick={() => tmplMoveExercise(item.id, -1)} disabled={ei === 0}>↑</button>
+                      <button style={{...S.moveBtn, color: theme.mutedText, background: theme.surfaceAlt}} onClick={() => tmplMoveExercise(item.id, 1)} disabled={ei === editingRoutine.exercises.length - 1}>↓</button>
+                    </div>
+                    <button style={{...S.moveBtn, color: theme.mutedText, background: theme.surfaceAlt, fontSize: 10, padding: "2px 6px"}} title="Duplicate" onClick={() => {
+                      const copy = JSON.parse(JSON.stringify(item));
+                      copy.id = uid();
+                      setEditingRoutine(r => {
+                        const idx = r.exercises.findIndex(e => e.id === item.id);
+                        const exs = [...r.exercises];
+                        exs.splice(idx + 1, 0, copy);
+                        return { ...r, exercises: exs };
+                      });
+                    }}>⧉</button>
+                    <button style={{...S.removeBtn, color: theme.mutedText}} onClick={() => tmplRemoveExercise(item.id)}>✕</button>
                   </div>
-                ))}
-                <button style={{...S.addSetBtn, color: theme.mutedText}} onClick={() => tmplAddSet(ex.id)}>+ Add Set</button>
-              </div>
-            ))}
+                  <label style={S.dropSetToggleRow}>
+                    <input type="checkbox" checked={item.allowDropSets !== false} onChange={() => tmplToggleDropSets(item.id)} style={S.dropSetCheckbox} />
+                    <span style={{...S.dropSetToggleLabel, color: theme.primaryText, fontWeight: 700}}>Allow drop sets</span>
+                  </label>
+                  <label style={S.dropSetToggleRow}>
+                    <input type="checkbox" checked={item.calisthenics === true} onChange={() => tmplToggleCalisthenics(item.id)} style={S.dropSetCheckbox} />
+                    <span style={{...S.dropSetToggleLabel, color: theme.primaryText, fontWeight: 700}}>Calisthenics (reps only)</span>
+                  </label>
+                  <div style={S.setHeaderRowTemplate}>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Set</span>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Category</span>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Reps</span>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Rest</span>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Notes</span>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}></span>
+                  </div>
+                  {item.sets.map((set, si) => (
+                    <div key={si}>
+                      <div style={S.setRowTemplate}>
+                        <span style={{...S.setNum, color: theme.mutedText}}>{si + 1}</span>
+                        <select style={{...S.setCatSelectSmall, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText, fontWeight: 600}} value={set.category || "Working Set"} onChange={e => tmplUpdateSet(item.id, si, "category", e.target.value)}>
+                          {SET_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                        <input style={{...S.setInput, background: theme.inputBg, borderColor: theme.inputBorder, color: theme.primaryText, fontWeight: 600}} placeholder="—" value={set.reps} onChange={e => tmplUpdateSet(item.id, si, "reps", e.target.value)} inputMode="numeric" />
+                        <input style={{...S.setInput, background: theme.inputBg, borderColor: theme.inputBorder, color: theme.primaryText, fontWeight: 600}} placeholder="—" value={set.rest} onChange={e => tmplUpdateSet(item.id, si, "rest", e.target.value)} />
+                        <button style={set.notes ? {...S.notesBtnFilled, color: T.accent, background: theme.accentDim, borderColor: T.accentBorder} : {...S.notesBtn, color: theme.primaryText, background: theme.surface, borderColor: theme.border}} onClick={() => { setNotesModal({ context: "tmpl", exId: item.id, si }); setNotesDraft(set.notes || ""); }}>{set.notes ? "📝" : "+"} Notes</button>
+                        <button style={{...S.removeSetBtn, color: theme.mutedText}} onClick={() => tmplRemoveSet(item.id, si)}>–</button>
+                      </div>
+                      {set.notes ? <div style={{fontSize: 11, color: theme.mutedText, padding: "2px 8px 6px", fontStyle: "italic"}}>{set.notes}</div> : null}
+                    </div>
+                  ))}
+                  <button style={{...S.addSetBtn, color: theme.mutedText}} onClick={() => tmplAddSet(item.id)}>+ Add Set</button>
+                </div>
+              );
+            })}
 
-            <button style={S.addExBtn} onClick={tmplAddExercise}>+ Add Exercise</button>
+            <div style={{display: "flex", gap: 10, marginBottom: 8}}>
+              <button style={{...S.addExBtn, flex: 1}} onClick={tmplAddExercise}>+ Add Exercise</button>
+              <button style={{...S.addExBtn, flex: 1, borderColor: T.accentBorder, color: T.accent}} onClick={tmplAddSuperset}>+ Add Superset</button>
+            </div>
             <div style={S.saveTemplateRow}>
               <button style={{...S.saveTemplateBtn, background: T.accent, color: theme.app}} onClick={saveRoutineTemplate}>Save Template</button>
             </div>
@@ -1325,98 +1737,210 @@ export default function App() {
                 <div style={{...S.heroLabel, color: T.accent}}>LOGGING</div>
                 <h2 style={{...S.logTitle, color: theme.primaryText}}>{activeRoutine && activeRoutine.name}</h2>
                 <div style={{...S.logDate, color: theme.mutedText}}>{formatDate(currentSession.date)}</div>
-                {prevSession && <div style={{...S.prevLabel, color: theme.mutedText}}>PREV: {formatDate(prevSession.date)}</div>}
+                {prevSession && <div style={{...S.prevLabel, color: "88cc00"}}>PREV: {formatDate(prevSession.date)}</div>}
+                <div style={{fontSize: 13, color: T.accent, fontWeight: 700, letterSpacing: "0.08em", marginTop: 4}}>
+                  ⏱ {formatTime(sessionElapsed)}
+                </div>
               </div>
-              <button style={{...S.completeBtn, background: theme.accent, color: theme.app}} onClick={completeSession}>Complete Session</button>
+              <div style={{display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end"}}>
+                <button style={{...S.completeBtn, background: T.accent, color: theme.app}} onClick={confirmCompleteSession}>Complete ✓</button>
+                <button style={{fontSize: 11, color: theme.dangerText, background: "none", border: "1px solid " + theme.dangerBorder, borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontFamily: "'DM Mono',monospace", letterSpacing: "0.08em"}} onClick={() => { setPendingNav("home"); setShowDiscardConfirm(true); }}>Discard ✕</button>
+              </div>
             </div>
 
-            {(() => { let globalSetIndex = 0; return currentSession.exercises.map((ex, ei) => (
-              <div key={ex.id} style={{...S.exerciseCard, background: theme.surface, borderColor: theme.borderSubtle}}>
-                <div style={S.exHeader}>
-                  <span style={{...S.exNum, color: T.accent}}>#{ei + 1}</span>
-                  <span style={{...S.exLogName, color: theme.primaryText}}>{ex.name || "Exercise"}</span>
+            {(() => {
+              let globalSetIndex = 0;
 
-                </div>
+              // Group exercises into blocks: superset members share a block, singles are alone
+              const blocks = [];
+              currentSession.exercises.forEach(ex => {
+                if (ex.supersetId) {
+                  const existing = blocks.find(b => b.ssId === ex.supersetId);
+                  if (existing) existing.exercises.push(ex);
+                  else blocks.push({ type: "superset", ssId: ex.supersetId, exercises: [ex] });
+                } else {
+                  blocks.push({ type: "single", exercises: [ex] });
+                }
+              });
 
-                {ex.sets.map((set, si) => {
-                  const thisGlobalIndex = globalSetIndex++;
-                  const prev = getPrevSetData(prevSession, ex.name, si);
-                  const cat = set.category || ex.category;
-                  const isWorking = cat === "Working Set";
-                  const tmplEx = activeRoutine && activeRoutine.exercises.find(e => e.name.trim().toLowerCase() === ex.name.trim().toLowerCase());
-                  const tmplReps = tmplEx && tmplEx.sets[si] && tmplEx.sets[si].reps || "";
-                  const suggestedWeight = ex.name
-                    ? isWorking
-                      ? suggestWeight(data.sessions, ex.name, si, tmplReps)
-                      : suggestWarmupWeight(data.sessions, ex.name, si, currentSession && currentSession.exercises)
-                    : null;
-                  const isDone = !!(set.reps || set.weight);
-                  const catColor = cat === "Working Set" ? T.workingBadge : T.warmupBadge;
-                  // Rest display between sets: show after previous set if completed, skip before first set
-                  const prevKey = si > 0 ? ex.id + ":" + (si - 1)
-                    : ei > 0 ? (() => { const pex = currentSession.exercises[ei - 1]; return pex && pex.sets && pex.sets.length ? pex.id + ":" + (pex.sets.length - 1) : null; })()
-                    : null;
-                  const isFirstSetEver = thisGlobalIndex === 0;
-                  const prevSetDone = prevKey && (() => {
-                    const [pExId, pSi] = prevKey.split(":");
-                    const pEx = currentSession.exercises.find(e => e.id === pExId);
-                    const pSet = pEx && pEx.sets && pEx.sets[parseInt(pSi)];
-                    return !!(pSet && (pSet.reps || pSet.weight));
-                  })();
-                  const snapshotElapsed = prevKey && restSnapshot[prevKey];
-                  const isCurrentlyResting = restRunning && lastCompletedKey === prevKey;
+              // Helper: find the template exercise for suggestions (handles supersets)
+              function getTmplEx(exName) {
+                if (!activeRoutine) return null;
+                for (const item of activeRoutine.exercises) {
+                  if (item.type === "superset") {
+                    const found = item.exercises.find(e => e.name && e.name.trim().toLowerCase() === exName.trim().toLowerCase());
+                    if (found) return found;
+                  } else if (item.name && item.name.trim().toLowerCase() === exName.trim().toLowerCase()) {
+                    return item;
+                  }
+                }
+                return null;
+              }
+
+              // Helper: get the Firestore key of the last set in a block
+              function lastKeyOfBlock(b) {
+                const lastEx = b.exercises[b.exercises.length - 1];
+                if (!lastEx || !lastEx.sets || !lastEx.sets.length) return null;
+                return lastEx.id + ":" + (lastEx.sets.length - 1);
+              }
+
+              // Helper: render a single set row (shared by superset and single paths)
+              function renderSetRow(ex, set, si, isFirstSetEver, prevKey) {
+                const prev = getPrevSetData(prevSession, ex.name, si);
+                const cat = set.category || ex.category;
+                const isWorking = cat === "Working Set";
+                const tmplEx = getTmplEx(ex.name);
+                const tmplReps = tmplEx && tmplEx.sets[si] && tmplEx.sets[si].reps || "";
+                const isCalisthenics = !!(ex.calisthenics || (tmplEx && tmplEx.calisthenics));
+                const suggestedWeight = isCalisthenics ? null
+                  : ex.name ? (isWorking
+                    ? suggestWeight(data.sessions, ex.name, si, tmplReps)
+                    : suggestWarmupWeight(data.sessions, ex.name, si, currentSession.exercises))
+                  : null;
+                const suggestedCaliReps = isCalisthenics && ex.name && isWorking
+                  ? suggestCalisthenicsReps(data.sessions, ex.name, si, tmplReps)
+                  : null;
+                const isDone = !!(set.reps || (!isCalisthenics && set.weight));
+                const catColor = isWorking ? T.workingBadge : T.warmupBadge;
+                const prevSetDone = prevKey && (() => {
+                  const [pExId, pSi] = prevKey.split(":");
+                  const pEx = currentSession.exercises.find(e => e.id === pExId);
+                  const pSet = pEx && pEx.sets && pEx.sets[parseInt(pSi)];
+                  return !!(pSet && (pSet.reps || pSet.weight));
+                })();
+                const snapshotElapsed = prevKey && restSnapshot[prevKey];
+                const isCurrentlyResting = restRunning && lastCompletedKey === prevKey;
+
+                return (
+                  <div key={si}>
+                    {!isFirstSetEver && prevSetDone && (
+                      <div style={{...S.restBetweenSets, background: isCurrentlyResting ? theme.accentDim : theme.surfaceAlt, borderColor: isCurrentlyResting ? T.accentBorder : theme.borderSubtle}}>
+                        <div style={{display: "flex", flexDirection: "column", alignItems: "flex-start"}}>
+                          <span style={{fontSize: 9, color: isCurrentlyResting ? T.accent : theme.primaryText, fontWeight: 700, letterSpacing: "0.1em"}}>REST</span>
+                          {tmplEx && tmplEx.sets[si] && tmplEx.sets[si - 1] && tmplEx.sets[si - 1].rest ? (
+                            <span style={{fontSize: 9, color: theme.mutedText, fontWeight: 600}}>rec: {tmplEx.sets[si - 1].rest}</span>
+                          ) : tmplEx && tmplEx.sets[si > 0 ? si - 1 : 0] && tmplEx.sets[si > 0 ? si - 1 : 0].rest ? (
+                            <span style={{fontSize: 9, color: theme.mutedText, fontWeight: 600}}>rec: {tmplEx.sets[si > 0 ? si - 1 : 0].rest}</span>
+                          ) : null}
+                        </div>
+                        <span style={{fontSize: 18, fontWeight: 900, color: isCurrentlyResting ? T.accent : theme.mutedText}}>
+                          {isCurrentlyResting ? formatTime(restElapsed) : snapshotElapsed ? formatTime(snapshotElapsed) : "—"}
+                        </span>
+                      </div>
+                    )}
+                    <button
+                      style={{...S.setRowSummary, background: isDone ? theme.accentDim : theme.inputBg, borderColor: isDone ? T.accentBorder : theme.border}}
+                      onClick={() => openSetModal(ex.id, si)}
+                    >
+                      <span style={S.setRowSummaryLeft}>
+                        <span style={{...S.setNumLabel, color: theme.mutedText}}>{si + 1}</span>
+                        <span style={{fontSize: 7, color: catColor, fontWeight: 700, letterSpacing: "0.04em"}}>{isWorking ? "Wrk" : "Wup"}</span>
+                      </span>
+                      <span style={S.setRowSummaryData}>
+                        {isDone ? (
+                          <>
+                            <span style={{...S.setRowSummaryVal, color: theme.primaryText}}>{set.reps || "—"} reps</span>
+                            {!isCalisthenics && <span style={{...S.setRowSummaryVal, color: theme.primaryText}}>{set.weight || "—"} lbs</span>}
+                            {set.difficulty && <span style={{fontSize: 10, color: theme.mutedText}}>{set.difficulty}</span>}
+                            {(() => {
+                              const goalReps = parseFloat(tmplReps);
+                              const actReps = parseFloat(set.reps);
+                              const goalWt = parseFloat(isCalisthenics ? null : (suggestedWeight));
+                              const actWt = parseFloat(set.weight);
+                              const repPct = !isNaN(goalReps) && goalReps > 0 && !isNaN(actReps) ? Math.round((actReps / goalReps) * 100) : null;
+                              const wtPct = !isCalisthenics && !isNaN(goalWt) && goalWt > 0 && !isNaN(actWt) ? Math.round((actWt / goalWt) * 100) : null;
+                              if (!repPct && !wtPct) return null;
+                              const pctColor = p => p >= 100 ? T.workingTarget : p >= 85 ? T.warmupTarget : theme.dangerText;
+                              return (
+                                <span style={{fontSize: 9, letterSpacing: "0.04em", display: "flex", gap: 4}}>
+                                  {repPct != null && <span style={{color: pctColor(repPct), fontWeight: 700}}>{repPct}% reps</span>}
+                                  {wtPct != null && <span style={{color: pctColor(wtPct), fontWeight: 700}}>{wtPct}% wt</span>}
+                                </span>
+                              );
+                            })()}
+                          </>
+                        ) : (
+                          <>
+                            {isCalisthenics && suggestedCaliReps && <span style={{fontSize: 11, color: isWorking ? T.workingTarget : T.warmupTarget}}>Target: {suggestedCaliReps} reps</span>}
+                            {!isCalisthenics && suggestedWeight && <span style={{fontSize: 11, color: isWorking ? T.workingTarget : T.warmupTarget}}>Target: {tmplReps ? tmplReps + " reps - " : ""}{suggestedWeight} lbs</span>}
+                            {!suggestedWeight && !suggestedCaliReps && <span style={{fontSize: 11, color: theme.mutedText}}>Tap to log</span>}
+                          </>
+                        )}
+                      </span>
+                      <span style={{...S.setRowSummaryIcon, color: isDone ? T.accent : theme.mutedText}}>{isDone ? "✓" : "›"}</span>
+                    </button>
+                    {set.instruction ? (
+                      <div style={{fontSize: 11, color: T.accent, padding: "3px 14px 4px", fontStyle: "italic", opacity: 0.9, letterSpacing: "0.03em"}}>📋 {set.instruction}</div>
+                    ) : null}
+                    {set.notes ? (
+                      <div style={{fontSize: 11, color: theme.mutedText, padding: "1px 14px 6px", fontStyle: "italic"}}>✏ {set.notes}</div>
+                    ) : null}
+                    {isWorking && isDone && (set.dropSets || []).length > 0 && (
+                      <div style={{marginLeft: 40, marginTop: -4, marginBottom: 6}}>
+                        {(set.dropSets || []).map((ds, di) => (
+                          <div key={di} style={{display: "flex", alignItems: "center", gap: 8, padding: "5px 12px", borderLeft: "2px solid " + T.dropTarget + "55", marginLeft: 8, marginBottom: 2}}>
+                            <span style={{fontSize: 9, color: T.dropBadge, fontWeight: 700, minWidth: 24}}>D{di + 1}</span>
+                            {(ds.reps || ds.weight)
+                              ? <span style={{fontSize: 12, color: theme.primaryText, fontWeight: 700}}>{ds.reps || "—"} reps - {ds.weight || "—"} lbs{ds.difficulty ? " - " + ds.difficulty : ""}</span>
+                              : <span style={{fontSize: 11, color: theme.subtleText, fontWeight: 700, fontStyle: "italic"}}>not logged</span>
+                            }
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              }
+
+              return blocks.map((block, bi) => {
+                const blockNum = bi + 1;
+
+                if (block.type === "superset") {
                   return (
-                    <div key={si}>
-                      {!isFirstSetEver && prevSetDone && (
-                        <div style={{...S.restBetweenSets, background: isCurrentlyResting ? theme.accentDim : theme.surfaceAlt, borderColor: isCurrentlyResting ? T.accentBorder : theme.borderSubtle}}>
-                          <span style={{fontSize: 9, color: isCurrentlyResting ? T.accent : theme.mutedText, fontWeight: 700, letterSpacing: "0.1em"}}>REST</span>
-                          <span style={{fontSize: 18, fontWeight: 900, color: isCurrentlyResting ? T.accent : theme.mutedText}}>
-                            {isCurrentlyResting ? formatTime(restElapsed) : snapshotElapsed ? formatTime(snapshotElapsed) : "—"}
-                          </span>
+                    <div key={block.ssId} style={{background: theme.accentDim, border: "2px solid " + T.accentBorder, borderRadius: 12, padding: 12, marginBottom: 16}}>
+                      <div style={{display: "flex", alignItems: "center", gap: 8, marginBottom: 10}}>
+                        <span style={{fontSize: 10, color: T.accent, fontWeight: 700, letterSpacing: "0.12em"}}>SUPERSET #{blockNum}</span>
+                        <span style={{fontSize: 10, color: theme.primaryText, fontWeight: 700}}>{block.exercises.length} exercises</span>
+                      </div>
+                      {block.exercises.map((ex, xi) => (
+                        <div key={ex.id} style={{...S.exerciseCard, background: theme.surface, borderColor: T.accentBorder + "66", marginBottom: xi < block.exercises.length - 1 ? 10 : 0}}>
+                          <div style={S.exHeader}>
+                            <span style={{...S.exNum, color: T.accent}}>{blockNum}{String.fromCharCode(65 + xi)}</span>
+                            <span style={{...S.exLogName, color: theme.primaryText}}>{ex.name || "Exercise"}</span>
+                          </div>
+                          {ex.sets.map((set, si) => {
+                            const thisGlobalIndex = globalSetIndex++;
+                            const prevKey = si > 0
+                              ? ex.id + ":" + (si - 1)
+                              : xi > 0
+                                ? lastKeyOfBlock({ exercises: [block.exercises[xi - 1]] })
+                                : bi > 0 ? lastKeyOfBlock(blocks[bi - 1]) : null;
+                            return renderSetRow(ex, set, si, thisGlobalIndex === 0, prevKey);
+                          })}
                         </div>
-                      )}
-                      <button style={{...S.setRowSummary, background: isDone ? theme.accentDim : theme.inputBg, borderColor: isDone ? T.accentBorder : theme.border}} onClick={() => openSetModal(ex.id, si)}>
-                        <span style={S.setRowSummaryLeft}>
-                          <span style={{...S.setNumLabel, color: theme.mutedText}}>{si + 1}</span>
-                          <span style={{fontSize: 7, color: catColor, fontWeight: 700, letterSpacing: "0.04em"}}>{cat === "Working Set" ? "Wrk" : "Wup"}</span>
-                        </span>
-                        <span style={S.setRowSummaryData}>
-                          {isDone ? (
-                            <>
-                              <span style={{...S.setRowSummaryVal, color: theme.primaryText}}>{set.reps || "—"} reps</span>
-                              <span style={{...S.setRowSummaryVal, color: theme.primaryText}}>{set.weight || "—"} lbs</span>
-                              
-                              {set.difficulty && <span style={{fontSize: 10, color: theme.mutedText}}>{set.difficulty}</span>}
-                            </>
-                          ) : (
-                            <>
-                              {suggestedWeight && <span style={{fontSize: 11, color: isWorking ? T.workingTarget : T.warmupTarget}}>Target: {tmplReps ? tmplReps + " reps - " : ""}{suggestedWeight} lbs</span>}
-                              {!suggestedWeight && <span style={{fontSize: 11, color: theme.mutedText}}>Tap to log</span>}
-                            </>
-                          )}
-                        </span>
-                        <span style={{...S.setRowSummaryIcon, color: isDone ? T.accent : theme.mutedText}}>{isDone ? "✓" : "›"}</span>
-                      </button>
-                      {/* Drop set summary — nested under parent set when completed */}
-                      {isWorking && isDone && (set.dropSets || []).length > 0 && (
-                        <div style={{marginLeft: 40, marginTop: -4, marginBottom: 6}}>
-                          {(set.dropSets || []).map((ds, di) => (
-                            <div key={di} style={{display: "flex", alignItems: "center", gap: 8, padding: "5px 12px", borderLeft: "2px solid " + T.dropTarget + "55", marginLeft: 8, marginBottom: 2}}>
-                              <span style={{fontSize: 9, color: T.dropBadge, fontWeight: 700, minWidth: 24}}>D{di + 1}</span>
-                              {(ds.reps || ds.weight) ? (
-                                <span style={{fontSize: 12, color: theme.mutedText}}>{ds.reps || "—"} reps - {ds.weight || "—"} lbs{ds.difficulty ? " - " + ds.difficulty : ""}</span>
-                              ) : (
-                                <span style={{fontSize: 11, color: theme.mutedText, fontStyle: "italic"}}>not logged</span>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
+                      ))}
                     </div>
                   );
-                })}
-              </div>
-            ));
+                }
+
+                // Single exercise
+                const ex = block.exercises[0];
+                return (
+                  <div key={ex.id} style={{...S.exerciseCard, background: theme.surface, borderColor: theme.borderSubtle}}>
+                    <div style={S.exHeader}>
+                      <span style={{...S.exNum, color: T.accent}}>#{blockNum}</span>
+                      <span style={{...S.exLogName, color: theme.primaryText}}>{ex.name || "Exercise"}</span>
+                    </div>
+                    {ex.sets.map((set, si) => {
+                      const thisGlobalIndex = globalSetIndex++;
+                      const prevKey = si > 0
+                        ? ex.id + ":" + (si - 1)
+                        : bi > 0 ? lastKeyOfBlock(blocks[bi - 1]) : null;
+                      return renderSetRow(ex, set, si, thisGlobalIndex === 0, prevKey);
+                    })}
+                  </div>
+                );
+              });
             })()}
           </div>
         )}
@@ -1447,7 +1971,7 @@ export default function App() {
                 <button style={{...S.historyCard, background: theme.surface, borderColor: theme.borderSubtle}} onClick={() => { setSelectedSession(s); setView("session"); }}>
                   <div>
                     <div style={{...S.historyRoutine, color: theme.primaryText}}>{getRoutineName(s.routineId)}</div>
-                    <div style={{...S.historyMeta, color: theme.mutedText}}>{formatDate(s.date)} - {s.exercises.length} exercise{s.exercises.length !== 1 ? "s" : ""} - {s.exercises.reduce((a, e) => a + e.sets.length, 0)} sets</div>
+                    <div style={{...S.historyMeta, color: theme.mutedText}}>{formatDate(s.date)} · {s.exercises.length} exercise{s.exercises.length !== 1 ? "s" : ""} · {s.exercises.reduce((a, e) => a + (e.sets ? e.sets.length : 0), 0)} sets{s.duration ? " · " + formatTime(s.duration) : ""}</div>
                   </div>
                   <span style={{...S.chevron, color: theme.mutedText}}>›</span>
                 </button>
@@ -1585,51 +2109,111 @@ export default function App() {
             </div>
             <div style={{...S.heroLabel, color: T.accent}}>{getRoutineName(selectedSession.routineId)}</div>
             <h2 style={{...S.heroTitle, color: theme.primaryText}}>{formatDate(selectedSession.date)}</h2>
-            {selectedSession.exercises.map((ex, ei) => (
-              <div key={ex.id} style={{...S.exerciseCard, background: theme.surface, borderColor: theme.borderSubtle}}>
-                <div style={S.exViewHeader}>
-                  <span style={{...S.exNum, color: T.accent}}>#{ei + 1}</span>
-                  <span style={{...S.exViewName, color: theme.primaryText}}>{ex.name || "Unnamed Exercise"}</span>
 
-                </div>
-                <div style={S.setHeaderRowView}>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Set</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Reps</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Weight</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Rest</span>
-                  <span style={{...S.setHeaderCell, color: theme.mutedText}}>Notes</span>
-                </div>
-                {ex.sets.map((set, si) => {
-                  const cat = set.category || ex.category;
-                  return (
-                    <div key={si}>
-                      <div style={S.setRowView}>
-                        <span style={{...S.setNum, color: theme.mutedText}}>
-                          <span style={{...S.setNumLabel, color: theme.mutedText}}>{si + 1}</span>
-                          {cat && <span style={cat === "Working Set" ? {...S.setCatWorking, color: T.workingBadge} : {...S.setCatWarmup, color: T.warmupBadge}}>{cat === "Working Set" ? "Wrk" : "Wup"}</span>}
-                        </span>
-                        <span style={{...S.setCell, color: theme.primaryText}}>{set.reps || "—"}</span>
-                        <span style={{...S.setCell, color: theme.primaryText}}>{set.weight || "—"}</span>
-                        <span style={{...S.setCell, color: theme.primaryText}}>{set.rest || "—"}</span>
-                        <span style={{...S.setCellWide, color: theme.primaryText}}>{set.notes || "—"}</span>
-                      </div>
-                      {(set.dropSets || []).map((ds, di) => (
-                        <div key={di} style={S.setRowView}>
-                          <span style={{...S.setNum, color: theme.mutedText}}>
-                            <span style={{...S.setNumLabel, color: theme.mutedText}}>D{di + 1}</span>
-                            <span style={{...S.setCatDrop, color: T.dropBadge}}>Drp</span>
+            {(() => {
+              // Group exercises into blocks (superset or single) preserving order
+              const blocks = [];
+              selectedSession.exercises.forEach(ex => {
+                if (ex.supersetId) {
+                  const existing = blocks.find(b => b.ssId === ex.supersetId);
+                  if (existing) existing.exercises.push(ex);
+                  else blocks.push({ type: "superset", ssId: ex.supersetId, exercises: [ex] });
+                } else {
+                  blocks.push({ type: "single", exercises: [ex] });
+                }
+              });
+
+              // Renders the set rows for one exercise
+              const renderExSets = (ex, isCali) => (
+                <>
+                  <div style={{...S.setHeaderRowView, gridTemplateColumns: "36px 1fr 1fr 1fr 1fr 1fr"}}>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Set</span>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Reps</span>
+                    {!isCali && <span style={{...S.setHeaderCell, color: theme.mutedText}}>Weight</span>}
+                    {isCali  && <span style={{...S.setHeaderCell, color: theme.mutedText}}>—</span>}
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Rest</span>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Difficulty</span>
+                    <span style={{...S.setHeaderCell, color: theme.mutedText}}>Notes</span>
+                  </div>
+                  {ex.sets.map((set, si) => {
+                    const cat = set.category || ex.category;
+                    const isWorking = cat === "Working Set";
+                    const diffColor = set.difficulty === "Easy" ? T.warmupTarget
+                      : set.difficulty === "Medium" ? T.workingTarget
+                      : set.difficulty === "Difficult" ? "#ff8c00"
+                      : set.difficulty === "Extremely Difficult" ? T.dangerText || "#ff4444"
+                      : theme.mutedText;
+                    return (
+                      <div key={si}>
+                        <div style={{...S.setRowView, gridTemplateColumns: "36px 1fr 1fr 1fr 1fr 1fr", background: isWorking ? "transparent" : theme.surfaceAlt + "66", borderRadius: 4, marginBottom: 2}}>
+                          <span style={{display:"flex", flexDirection:"column", alignItems:"center", gap:1}}>
+                            <span style={{...S.setNumLabel, color: theme.mutedText}}>{si + 1}</span>
+                            {cat && <span style={isWorking ? {...S.setCatWorking, color: T.workingBadge} : {...S.setCatWarmup, color: T.warmupBadge}}>{isWorking ? "Wrk" : "Wup"}</span>}
                           </span>
-                          <span style={{...S.setCell, color: theme.primaryText}}>{ds.reps || "—"}</span>
-                          <span style={{ ...S.setCell, color: "#ff4d9e" }}>{ds.weight || "—"}</span>
-                          <span style={{...S.setCell, color: theme.primaryText}}>—</span>
-                          <span style={{...S.setCellWide, color: theme.primaryText}}>{ds.difficulty || "—"}</span>
+                          <span style={{...S.setCell, color: theme.primaryText, fontWeight: 700}}>{set.reps || "—"}</span>
+                          <span style={{...S.setCell, color: isCali ? theme.mutedText : theme.primaryText, fontWeight: 700}}>{isCali ? "—" : (set.weight || "—")}</span>
+                          <span style={{...S.setCell, color: theme.primaryText, fontWeight: 700}}>{set.rest || "—"}</span>
+                          <span style={{...S.setCell, color: diffColor, fontWeight: 700, fontSize: 10}}>{set.difficulty || "—"}</span>
+                          <span style={{...S.setCellWide, color: set.notes ? theme.primaryText : theme.mutedText, fontStyle: set.notes ? "italic" : "normal"}}>{set.notes || "—"}</span>
                         </div>
-                      ))}
+                        {(set.dropSets || []).map((ds, di) => (
+                          <div key={di} style={{...S.setRowView, gridTemplateColumns: "36px 1fr 1fr 1fr 1fr 1fr", background: theme.accentDim, borderRadius: 4, marginBottom: 2}}>
+                            <span style={{display:"flex", flexDirection:"column", alignItems:"center", gap:1}}>
+                              <span style={{...S.setNumLabel, color: T.dropBadge}}>D{di+1}</span>
+                              <span style={{...S.setCatDrop, color: T.dropBadge}}>Drp</span>
+                            </span>
+                            <span style={{...S.setCell, color: theme.primaryText, fontWeight: 700}}>{ds.reps || "—"}</span>
+                            <span style={{...S.setCell, color: T.dropTarget, fontWeight: 700}}>{ds.weight || "—"}</span>
+                            <span style={{...S.setCell, color: theme.mutedText}}>—</span>
+                            <span style={{...S.setCell, color: ds.difficulty === "Too Easy" ? "#aabbff" : ds.difficulty === "Extremely Difficult" ? (T.dangerText || "#ff4444") : ds.difficulty === "Difficult" ? "#ff8c00" : ds.difficulty === "Easy" ? T.warmupTarget : theme.primaryText, fontWeight: 700, fontSize: 10}}>{ds.difficulty || "—"}</span>
+                            <span style={{...S.setCellWide, color: ds.notes ? theme.primaryText : theme.mutedText, fontStyle: ds.notes ? "italic" : "normal"}}>{ds.notes || "—"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </>
+              );
+
+              return blocks.map((block, bi) => {
+                if (block.type === "superset") {
+                  return (
+                    <div key={block.ssId} style={{background: theme.accentDim, border: "2px solid " + T.accentBorder, borderRadius: 12, padding: 12, marginBottom: 16}}>
+                      <div style={{display: "flex", alignItems: "center", gap: 8, marginBottom: 10}}>
+                        <span style={{fontSize: 10, color: T.accent, fontWeight: 700, letterSpacing: "0.12em"}}>SUPERSET</span>
+                        <span style={{fontSize: 10, color: theme.primaryText, fontWeight: 700}}>{block.exercises.length} exercises</span>
+                      </div>
+                      {block.exercises.map((ex, xi) => {
+                        const isCali = !!ex.calisthenics;
+                        return (
+                          <div key={ex.id} style={{...S.exerciseCard, background: theme.surface, borderColor: T.accentBorder + "66", marginBottom: xi < block.exercises.length - 1 ? 10 : 0}}>
+                            <div style={S.exViewHeader}>
+                              <span style={{...S.exNum, color: T.accent}}>{String.fromCharCode(65 + xi)}</span>
+                              <span style={{...S.exViewName, color: theme.primaryText}}>{ex.name || "Unnamed"}</span>
+                              {isCali && <span style={{fontSize: 9, color: T.accent, fontWeight: 700, letterSpacing: "0.1em", background: theme.accentDim, padding: "2px 6px", borderRadius: 3}}>CALI</span>}
+                            </div>
+                            {renderExSets(ex, isCali)}
+                          </div>
+                        );
+                      })}
                     </div>
                   );
-                })}
-              </div>
-            ))}
+                }
+
+                const ex = block.exercises[0];
+                const isCali = !!ex.calisthenics;
+                return (
+                  <div key={ex.id} style={{...S.exerciseCard, background: theme.surface, borderColor: theme.borderSubtle}}>
+                    <div style={S.exViewHeader}>
+                      <span style={{...S.exNum, color: T.accent}}>#{bi + 1}</span>
+                      <span style={{...S.exViewName, color: theme.primaryText}}>{ex.name || "Unnamed Exercise"}</span>
+                      {isCali && <span style={{fontSize: 9, color: T.accent, fontWeight: 700, letterSpacing: "0.1em", background: theme.accentDim, padding: "2px 6px", borderRadius: 3}}>CALI</span>}
+                    </div>
+                    {renderExSets(ex, isCali)}
+                  </div>
+                );
+              });
+            })()}
           </div>
         )}
 
@@ -1673,7 +2257,7 @@ export default function App() {
                         {isToday && <span style={{fontSize: 8, color: T.accent, fontWeight: 700, letterSpacing: "0.1em", background: T.accentBorder, padding: "2px 6px", borderRadius: 3}}>TODAY</span>}
                       </div>
                       {!scheduleEditing && routine && (
-                        <span style={{fontSize: 10, color: theme.mutedText}}>{routine.exercises.length} ex</span>
+                        <span style={{fontSize: 10, color: theme.primaryText, fontWeight: 700}}>{flattenExercises(routine.exercises).length} ex</span>
                       )}
                     </div>
 
@@ -1683,7 +2267,9 @@ export default function App() {
                         value={routineId || ""}
                         onChange={e => {
                           const val = e.target.value;
-                          setData(d => ({ ...d, schedule: { ...(d.schedule || {}), [day]: val || null } }));
+                          const updSched2 = { ...(data.schedule || {}), [day]: val || null };
+                        setData(d => ({ ...d, schedule: updSched2 }));
+                        if (user) setDoc(doc(db, "userdata", user.uid), { schedule: updSched2 }, { merge: true });
                         }}
                       >
                         <option value="">— Unscheduled —</option>
@@ -1699,7 +2285,7 @@ export default function App() {
                           <button style={{...S.scheduleStartBtn, background: T.accent, color: theme.app}} onClick={() => {
                             const r = data.routines.find(r2 => r2.id === routineId);
                             if (r) {
-                              const exercises = r.exercises.map(e => ({...e, id: uid(), sets: e.sets.map(s => ({...s, weight: ""}))}));
+                              const exercises = flattenExercises(r.exercises).map(e => ({...e, id: uid(), sets: e.sets.map(s => ({...s, weight: ""}))}));
                               setActiveRoutine(r);
                               setCurrentSession({ routineId: r.id, date: new Date().toISOString(), exercises });
                               setView("log");
@@ -1729,6 +2315,24 @@ export default function App() {
               const latest = getLatestWorkingSetAvg(data.sessions, name);
               const isActive = activeBenchmark === name;
               const history = isActive ? getBenchmarkHistory(data.sessions, name) : [];
+              // Detect calisthenics: check routines and session history
+              const isCalisthenicsExercise = (() => {
+                // Check routines
+                for (const r of data.routines) {
+                  for (const item of r.exercises) {
+                    if (item.type === "superset") {
+                      if (item.exercises.some(e => e.name && e.name.trim().toLowerCase() === name.trim().toLowerCase() && e.calisthenics)) return true;
+                    } else if (item.name && item.name.trim().toLowerCase() === name.trim().toLowerCase() && item.calisthenics) return true;
+                  }
+                }
+                // Check sessions: if all logged weight values are null/empty, treat as calisthenics
+                const allWeightsEmpty = data.sessions.every(s => {
+                  const ex = s.exercises.find(e => e.name && e.name.trim().toLowerCase() === name.trim().toLowerCase());
+                  if (!ex) return true;
+                  return ex.sets.every(set => !set.weight || parseFloat(set.weight) <= 0);
+                });
+                return allWeightsEmpty && data.sessions.some(s => s.exercises.some(e => e.name && e.name.trim().toLowerCase() === name.trim().toLowerCase()));
+              })();
 
               return (
                 <div key={name} style={{...S.benchmarkCard, background: theme.surface, borderColor: theme.borderSubtle}}>
@@ -1737,11 +2341,15 @@ export default function App() {
                       <div style={{...S.benchmarkName, color: theme.primaryText}}>{name}</div>
                       {latest ? (
                         <div style={S.benchmarkStats}>
-                          <span style={S.benchmarkStat}>
-                            <span style={{...S.benchmarkStatLabel, color: theme.mutedText}}>Weight</span>
-                            <span style={{...S.benchmarkStatValue, color: T.benchmarkStat}}>{latest.weight !== null && latest.weight !== undefined ? latest.weight : "—"}</span>
-                          </span>
-                          <span style={{...S.benchmarkDivider, color: theme.mutedText}}>·</span>
+                          {!isCalisthenicsExercise && (
+                            <>
+                              <span style={S.benchmarkStat}>
+                                <span style={{...S.benchmarkStatLabel, color: theme.mutedText}}>Weight</span>
+                                <span style={{...S.benchmarkStatValue, color: T.benchmarkStat}}>{latest.weight !== null && latest.weight !== undefined ? latest.weight : "—"}</span>
+                              </span>
+                              <span style={{...S.benchmarkDivider, color: theme.mutedText}}>·</span>
+                            </>
+                          )}
                           <span style={S.benchmarkStat}>
                             <span style={{...S.benchmarkStatLabel, color: theme.mutedText}}>Reps</span>
                             <span style={{...S.benchmarkStatValue, color: T.benchmarkStat}}>{latest.reps !== null && latest.reps !== undefined ? latest.reps : "—"}</span>
@@ -1761,16 +2369,28 @@ export default function App() {
                       <ResponsiveContainer width="100%" height={200}>
                         <LineChart data={history} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
                           <XAxis dataKey="label" tick={{ fill: theme.mutedText, fontSize: 10 }} axisLine={false} tickLine={false} />
-                          <YAxis yAxisId="weight" tick={{ fill: theme.mutedText, fontSize: 10 }} axisLine={false} tickLine={false} />
-                          <YAxis yAxisId="reps" orientation="right" tick={{ fill: theme.mutedText, fontSize: 10 }} axisLine={false} tickLine={false} />
+                          {isCalisthenicsExercise ? (
+                            <YAxis tick={{ fill: theme.mutedText, fontSize: 10 }} axisLine={false} tickLine={false} />
+                          ) : (
+                            <>
+                              <YAxis yAxisId="weight" tick={{ fill: theme.mutedText, fontSize: 10 }} axisLine={false} tickLine={false} />
+                              <YAxis yAxisId="reps" orientation="right" tick={{ fill: theme.mutedText, fontSize: 10 }} axisLine={false} tickLine={false} />
+                            </>
+                          )}
                           <Tooltip
                             contentStyle={{ background: theme.surface, border: "1px solid " + theme.border, borderRadius: 6, fontSize: 11, color: theme.primaryText }}
                             labelStyle={{ color: theme.mutedText, marginBottom: 4 }}
                             itemStyle={{ color: "#e8e4dc" }}
                           />
                           <Legend wrapperStyle={{ fontSize: 10, color: theme.mutedText, paddingTop: 8 }} />
-                          <Line yAxisId="weight" type="monotone" dataKey="weight" name="Weight" stroke={CHART_WEIGHT_COLOR} strokeWidth={2} dot={{ fill: CHART_WEIGHT_COLOR, r: 3 }} connectNulls />
-                          <Line yAxisId="reps" type="monotone" dataKey="reps" name="Reps" stroke={CHART_REPS_COLOR} strokeWidth={2} dot={{ fill: CHART_REPS_COLOR, r: 3 }} connectNulls />
+                          {isCalisthenicsExercise ? (
+                            <Line type="monotone" dataKey="reps" name="Reps" stroke={CHART_REPS_COLOR} strokeWidth={2} dot={{ fill: CHART_REPS_COLOR, r: 3 }} connectNulls />
+                          ) : (
+                            <>
+                              <Line yAxisId="weight" type="monotone" dataKey="weight" name="Weight" stroke={CHART_WEIGHT_COLOR} strokeWidth={2} dot={{ fill: CHART_WEIGHT_COLOR, r: 3 }} connectNulls />
+                              <Line yAxisId="reps" type="monotone" dataKey="reps" name="Reps" stroke={CHART_REPS_COLOR} strokeWidth={2} dot={{ fill: CHART_REPS_COLOR, r: 3 }} connectNulls />
+                            </>
+                          )}
                         </LineChart>
                       </ResponsiveContainer>
                     </div>
@@ -1784,14 +2404,16 @@ export default function App() {
 
             {(() => {
               const allExercises = [...new Set(
-                data.routines.flatMap(r => r.exercises.map(e => e.name.trim())).filter(Boolean)
-              )].filter(name => !data.benchmarks.includes(name));
+                data.routines.flatMap(r => getExerciseNames(r.exercises).map(n => n.trim()))
+                  .concat(data.sessions.flatMap(s => s.exercises.map(e => (e.name || "").trim())))
+                  .filter(Boolean)
+              )].filter(name => !data.benchmarks.includes(name)).sort();
               return allExercises.length > 0 ? (
                 <div style={{...S.addBenchmarkRow, background: theme.surface, borderColor: theme.border}}>
                   <span style={{...S.addBenchmarkLabel, color: theme.mutedText}}>TRACK EXERCISE</span>
                   <select style={{...S.benchmarkSelect, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText}} value="" onChange={e => {
                     const name = e.target.value;
-                    if (name) { setData(d => ({ ...d, benchmarks: [...d.benchmarks, name] })); }
+                    if (name) { const upd = [...data.benchmarks, name]; setData(d => ({ ...d, benchmarks: upd })); if (user) setDoc(doc(db, "userdata", user.uid), { benchmarks: upd }, { merge: true }); }
                   }}>
                     <option value="">Select exercise...</option>
                     {allExercises.map(name => <option key={name} value={name}>{name}</option>)}
@@ -1817,8 +2439,15 @@ export default function App() {
             />
             <div style={S.modalActions}>
               <button style={{...S.confirmBtn, background: T.accent, color: theme.app}} onClick={() => {
-                if (notesModal.context === "tmpl") tmplUpdateSet(notesModal.exId, notesModal.si, "notes", notesDraft);
-                else sessionUpdateSet(notesModal.exId, notesModal.si, "notes", notesDraft);
+                if (notesModal.context === "tmpl") {
+                  if (notesModal.ssId) {
+                    tmplUpdateSsSet(notesModal.ssId, notesModal.exId, notesModal.si, "notes", notesDraft);
+                  } else {
+                    tmplUpdateSet(notesModal.exId, notesModal.si, "notes", notesDraft);
+                  }
+                } else {
+                  sessionUpdateSet(notesModal.exId, notesModal.si, "notes", notesDraft);
+                }
                 setNotesModal(null);
               }}>Save</button>
               <button style={{...S.modalCancel, color: theme.mutedText, background: theme.surfaceAlt, borderColor: theme.border}} onClick={() => setNotesModal(null)}>Discard</button>
@@ -1830,58 +2459,22 @@ export default function App() {
       {/* ── SETTINGS / THEME MODAL ── */}
       {showSettings && (
         <div style={S.modalOverlay}>
-          <div style={{...S.notesModalBox, background: theme.surface, borderColor: theme.border}}>
-            {/* Tab switcher */}
-            <div style={{display: "flex", gap: 4, marginBottom: 20, borderBottom: "1px solid " + theme.borderSubtle, paddingBottom: 12}}>
-              {["theme", "account"].map(tab => (
-                <button key={tab} style={{...S.settingsTabBtn, background: settingsTab === tab ? theme.surfaceAlt : "none", color: settingsTab === tab ? theme.primaryText : theme.mutedText, borderColor: settingsTab === tab ? theme.border : "transparent"}} onClick={() => { setSettingsTab(tab); setAccountMsg(""); }}>
-                  {tab === "theme" ? "Theme" : "Account"}
+          <div style={{...S.modalBox, background: theme.surface, borderColor: theme.border}}>
+            <div style={{...S.modalTitle, color: theme.primaryText}}>Theme</div>
+            <div style={S.themeGrid}>
+              {Object.entries(THEMES).map(([key, t]) => (
+                <button key={key} style={{...S.themePresetBtn, background: t.app, border: themeKey === key ? "2px solid " + t.accent : "1px solid " + t.border}} onClick={() => setThemePreset(key)}>
+                  <div style={S.themePreviewDots}>
+                    <span style={{...S.themePreviewDot, background: t.accent}} />
+                    <span style={{...S.themePreviewDot, background: t.workingTarget}} />
+                    <span style={{...S.themePreviewDot, background: t.warmupTarget}} />
+                    <span style={{...S.themePreviewDot, background: t.dropTarget}} />
+                  </div>
+                  <span style={{fontSize: 12, color: t.primaryText, fontWeight: themeKey === key ? 700 : 400}}>{t.name}</span>
+                  {themeKey === key && <span style={{fontSize: 10, color: t.accent, letterSpacing: "0.1em"}}>ACTIVE</span>}
                 </button>
               ))}
             </div>
-
-            {settingsTab === "theme" && (
-              <div>
-                <div style={{...S.modalTitle, color: theme.primaryText, marginBottom: 16}}>Theme</div>
-                <div style={S.themeGrid}>
-                  {Object.entries(THEMES).map(([key, t]) => (
-                    <button key={key} style={{...S.themePresetBtn, background: t.app, border: themeKey === key ? "2px solid " + t.accent : "1px solid " + t.border}} onClick={() => setThemePreset(key)}>
-                      <div style={S.themePreviewDots}>
-                        <span style={{...S.themePreviewDot, background: t.accent}} />
-                        <span style={{...S.themePreviewDot, background: t.workingTarget}} />
-                        <span style={{...S.themePreviewDot, background: t.warmupTarget}} />
-                        <span style={{...S.themePreviewDot, background: t.dropTarget}} />
-                      </div>
-                      <span style={{fontSize: 12, color: t.primaryText, fontWeight: themeKey === key ? 700 : 400}}>{t.name}</span>
-                      {themeKey === key && <span style={{fontSize: 10, color: t.accent, letterSpacing: "0.1em"}}>ACTIVE</span>}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {settingsTab === "account" && (
-              <div>
-                <div style={{...S.modalTitle, color: theme.primaryText, marginBottom: 16}}>Account</div>
-                <div style={{fontSize: 11, color: theme.mutedText, marginBottom: 16}}>Signed in as <strong style={{color: theme.primaryText}}>{getCredentials().username}</strong></div>
-                <div style={S.setModalField}>
-                  <label style={{...S.setModalLabel, color: theme.mutedText}}>NEW USERNAME</label>
-                  <input style={{...S.textInput, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText, width: "100%", boxSizing: "border-box"}} placeholder="Leave blank to keep current" value={newUsername} onChange={e => setNewUsername(e.target.value)} />
-                </div>
-                <div style={S.setModalField}>
-                  <label style={{...S.setModalLabel, color: theme.mutedText}}>NEW PASSWORD</label>
-                  <input type="password" style={{...S.textInput, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText, width: "100%", boxSizing: "border-box"}} placeholder="Leave blank to keep current" value={newPassword} onChange={e => setNewPassword(e.target.value)} />
-                </div>
-                <div style={{...S.setModalField, marginBottom: 16}}>
-                  <label style={{...S.setModalLabel, color: theme.mutedText}}>CONFIRM PASSWORD</label>
-                  <input type="password" style={{...S.textInput, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText, width: "100%", boxSizing: "border-box"}} placeholder="Confirm new password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} />
-                </div>
-                {accountMsg && <div style={{fontSize: 12, color: accountMsg.includes("success") ? T.accent : theme.dangerText, marginBottom: 12}}>{accountMsg}</div>}
-                <button style={{...S.confirmBtn, background: T.accent, color: theme.app, width: "100%", marginBottom: 10}} onClick={handleSaveAccount}>Save Changes</button>
-                <button style={{...S.modalCancel, color: theme.dangerText, borderColor: theme.dangerBorder, background: theme.dangerBg, width: "100%"}} onClick={handleLogout}>Sign Out</button>
-              </div>
-            )}
-
             <div style={{...S.modalActions, marginTop: 20}}>
               <button style={{...S.confirmBtn, background: theme.accent, color: theme.app}} onClick={() => setShowSettings(false)}>Done</button>
             </div>
@@ -1898,11 +2491,25 @@ export default function App() {
         if (!set) return null;
         const cat = isDropSet ? "Drop Set" : (set.category || ex.category);
         const isWorking = cat === "Working Set";
-        const tmplEx = activeRoutine && activeRoutine.exercises.find(e => e.name.trim().toLowerCase() === ex.name.trim().toLowerCase());
+        const tmplEx = activeRoutine && (() => {
+          for (const item of activeRoutine.exercises) {
+            if (item.type === "superset") {
+              const found = item.exercises.find(e => e.name.trim().toLowerCase() === ex.name.trim().toLowerCase());
+              if (found) return found;
+            } else if (item.name && item.name.trim().toLowerCase() === ex.name.trim().toLowerCase()) {
+              return item;
+            }
+          }
+          return null;
+        })();
+        const isCalisthenics = !!(ex.calisthenics || (tmplEx && tmplEx.calisthenics));
         const tmplReps = tmplEx && tmplEx.sets[si] && tmplEx.sets[si].reps || "";
-        const suggestedWeight = isDropSet
+        const suggestedWeight = isCalisthenics ? null : isDropSet
           ? suggestDropSet(data.sessions, ex.name, currentSession && currentSession.exercises, di, ex.sets[si] && ex.sets[si].dropSets)
           : (ex.name ? (isWorking ? suggestWeight(data.sessions, ex.name, si, tmplReps) : suggestWarmupWeight(data.sessions, ex.name, si, currentSession && currentSession.exercises)) : null);
+        const suggestedReps = isCalisthenics && ex.name && isWorking
+          ? suggestCalisthenicsReps(data.sessions, ex.name, si, tmplReps)
+          : null;
         const prev = isDropSet ? null : getPrevSetData(prevSession, ex.name, si);
         const catColor = cat === "Working Set" ? T.workingBadge : cat === "Drop Set" ? T.dropBadge : T.warmupBadge;
         const targetColor = cat === "Working Set" ? T.workingTarget : cat === "Drop Set" ? T.dropTarget : T.warmupTarget;
@@ -1912,7 +2519,7 @@ export default function App() {
               {/* Header */}
               <div style={S.setModalHeader}>
                 <div>
-                  <div style={{fontSize: 11, color: theme.mutedText, letterSpacing: "0.1em", marginBottom: 2}}>{ex.name}</div>
+                  <div style={{fontSize: 11, color: theme.primaryText, fontWeight: 700, letterSpacing: "0.1em", marginBottom: 2}}>{ex.name}</div>
                   <div style={{display: "flex", alignItems: "center", gap: 8}}>
                     <span style={{fontSize: 22, fontWeight: 900, color: theme.primaryText, fontFamily: "'Georgia',serif"}}>Set {si + 1}{isDropSet ? ` - Drop ${di + 1}` : ""}</span>
                     <span style={{fontSize: 10, color: catColor, fontWeight: 700, letterSpacing: "0.08em", background: catColor + "22", padding: "2px 6px", borderRadius: 3}}>{cat}</span>
@@ -1922,7 +2529,7 @@ export default function App() {
               </div>
 
               {/* Target & Previous */}
-              {(suggestedWeight || prev) && (
+              {(suggestedWeight || suggestedReps || prev) && (
                 <div style={{...S.setModalContext, borderColor: theme.borderSubtle}}>
                   {suggestedWeight && (
                     <div style={S.setModalContextRow}>
@@ -1930,29 +2537,46 @@ export default function App() {
                       <span style={{fontSize: 16, fontWeight: 800, color: targetColor}}>{isDropSet ? suggestedWeight.weight : suggestedWeight} lbs{tmplReps && !isDropSet ? "  -  " + tmplReps + " reps" : ""}{isDropSet && suggestedWeight.reps ? "  -  " + suggestedWeight.reps + " reps" : ""}</span>
                     </div>
                   )}
+                  {suggestedReps && (
+                    <div style={S.setModalContextRow}>
+                      <span style={{fontSize: 10, color: targetColor, fontWeight: 700, letterSpacing: "0.1em"}}>TARGET REPS</span>
+                      <span style={{fontSize: 16, fontWeight: 800, color: targetColor}}>{suggestedReps} reps</span>
+                    </div>
+                  )}
                   {prev && (
                     <div style={S.setModalContextRow}>
                       <span style={{fontSize: 10, color: theme.mutedText, fontWeight: 700, letterSpacing: "0.1em"}}>PREVIOUS</span>
-                      <span style={{fontSize: 14, color: theme.primaryText}}>{prev.weight || "—"} lbs  -  {prev.reps || "—"} reps{prev.rest ? "  -  " + prev.rest + " rest" : ""}</span>
+                      <span style={{fontSize: 14, color: theme.primaryText}}>{isCalisthenics ? "" : (prev.weight || "—") + " lbs  -  "}{prev.reps || "—"} reps{prev.rest ? "  -  " + prev.rest + " rest" : ""}</span>
+                      {prev.notes ? <span style={{fontSize: 11, color: theme.mutedText, fontStyle: "italic", marginTop: 2}}>"{prev.notes}"</span> : null}
                     </div>
                   )}
                 </div>
               )}
 
+              {/* Template instruction note */}
+              {set.instruction && (
+                <div style={{background: theme.accentDim, border: "1px solid " + T.accentBorder, borderRadius: 8, padding: "10px 14px", marginBottom: 12}}>
+                  <div style={{fontSize: 9, color: T.accent, fontWeight: 700, letterSpacing: "0.12em", marginBottom: 4}}>INSTRUCTION</div>
+                  <div style={{fontSize: 13, color: theme.primaryText}}>{set.instruction}</div>
+                </div>
+              )}
+
               {/* Inputs */}
-              <div style={S.setModalInputs}>
+              <div style={isCalisthenics ? S.setModalField : S.setModalInputs}>
                 <div style={S.setModalField}>
-                  <label style={{...S.setModalLabel, color: theme.mutedText}}>Reps</label>
+                  <label style={{...S.setModalLabel, color: theme.primaryText, fontWeight: 700}}>Reps</label>
                   <input style={{...S.setModalInput, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText}} type="number" inputMode="numeric" placeholder="0" value={setDraft.reps} onChange={e => setSetDraft(d => ({...d, reps: e.target.value}))} autoFocus />
                 </div>
-                <div style={S.setModalField}>
-                  <label style={{...S.setModalLabel, color: theme.mutedText}}>Weight (lbs)</label>
-                  <input style={{...S.setModalInput, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText}} type="number" inputMode="decimal" placeholder="0" value={setDraft.weight} onChange={e => setSetDraft(d => ({...d, weight: e.target.value}))} />
-                </div>
+                {!isCalisthenics && (
+                  <div style={S.setModalField}>
+                    <label style={{...S.setModalLabel, color: theme.primaryText, fontWeight: 700}}>Weight (lbs)</label>
+                    <input style={{...S.setModalInput, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText}} type="number" inputMode="decimal" placeholder="0" value={setDraft.weight} onChange={e => setSetDraft(d => ({...d, weight: e.target.value}))} />
+                  </div>
+                )}
               </div>
 
               <div style={S.setModalField}>
-                <label style={{...S.setModalLabel, color: theme.mutedText}}>Difficulty</label>
+                <label style={{...S.setModalLabel, color: theme.primaryText, fontWeight: 700}}>Difficulty</label>
                 <select style={{...S.setModalInput, background: theme.inputBg, borderColor: theme.border, color: setDraft.difficulty ? theme.primaryText : theme.mutedText, padding: "14px 12px"}} value={setDraft.difficulty} onChange={e => setSetDraft(d => ({...d, difficulty: e.target.value}))}>
                   <option value="">Select difficulty...</option>
                   {DIFFICULTIES.map(d => <option key={d} value={d}>{d}</option>)}
@@ -1960,7 +2584,7 @@ export default function App() {
               </div>
 
               <div style={S.setModalField}>
-                <label style={{...S.setModalLabel, color: theme.mutedText}}>Notes</label>
+                <label style={{...S.setModalLabel, color: theme.primaryText, fontWeight: 700}}>Notes</label>
                 <textarea style={{...S.notesTextarea, background: theme.inputBg, borderColor: theme.border, color: theme.primaryText, minHeight: 64, marginBottom: 0}} placeholder="Optional notes..." value={setDraft.notes} onChange={e => setSetDraft(d => ({...d, notes: e.target.value}))} />
               </div>
 
@@ -1999,15 +2623,57 @@ export default function App() {
                 </div>
               )}
 
-              <button style={{...S.completeBtn, background: T.accent, color: theme.app, width: "100%", marginTop: 16, padding: 16, fontSize: 14}} onClick={completeSet}>
-                Complete Set ✓
-              </button>
+              {(() => {
+                const missingFields = [];
+                if (!setDraft.reps || parseFloat(setDraft.reps) <= 0) missingFields.push("Reps");
+                if (!isCalisthenics && (!setDraft.weight || parseFloat(setDraft.weight) <= 0)) missingFields.push("Weight");
+                if (!setDraft.difficulty) missingFields.push("Difficulty");
+                const canComplete = missingFields.length === 0;
+                return (
+                  <>
+                    {!canComplete && (
+                      <div style={{background: theme.dangerBg, border: "1px solid " + theme.dangerBorder, borderRadius: 8, padding: "10px 14px", marginTop: 12}}>
+                        <div style={{fontSize: 11, color: theme.dangerText, fontWeight: 700, letterSpacing: "0.08em"}}>
+                          Required: {missingFields.join(", ")}
+                        </div>
+                      </div>
+                    )}
+                    <button
+                      style={{...S.completeBtn, background: canComplete ? T.accent : theme.surfaceAlt, color: canComplete ? theme.app : theme.mutedText, width: "100%", marginTop: 12, padding: 16, fontSize: 14, cursor: canComplete ? "pointer" : "not-allowed", border: canComplete ? "none" : "1px solid " + theme.border}}
+                      onClick={() => { if (canComplete) completeSet(); }}
+                    >
+                      Complete Set ✓
+                    </button>
+                  </>
+                );
+              })()}
             </div>
           </div>
         );
       })()}
 
       {/* ── DELETE CONFIRM MODAL ── */}
+      {deleteRoutineConfirmId && (() => {
+        const routineToDelete = data.routines.find(r => r.id === deleteRoutineConfirmId);
+        return (
+          <div style={S.modalOverlay}>
+            <div style={{...S.modalBox, background: theme.surface, borderColor: theme.border}}>
+              <div style={{...S.modalTitle, color: theme.primaryText}}>Delete Routine?</div>
+              <div style={{...S.modalBody, color: theme.mutedText}}>
+                Are you sure you want to delete <strong style={{color: theme.primaryText}}>{routineToDelete ? routineToDelete.name : "this routine"}</strong>? This cannot be undone.
+              </div>
+              <div style={S.modalActions}>
+                <button style={{...S.modalDiscard, background: theme.dangerBg, borderColor: theme.dangerBorder, color: theme.dangerText}} onClick={() => {
+                  deleteRoutine(deleteRoutineConfirmId);
+                  setDeleteRoutineConfirmId(null);
+                }}>Delete</button>
+                <button style={{...S.modalCancel, color: theme.mutedText, background: theme.surfaceAlt, borderColor: theme.border}} onClick={() => setDeleteRoutineConfirmId(null)}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {deleteConfirmId && (
         <div style={S.modalOverlay}>
           <div style={{...S.modalBox, background: theme.surface, borderColor: theme.border}}>
@@ -2022,6 +2688,19 @@ export default function App() {
       )}
 
       {/* ── DISCARD CONFIRM MODAL ── */}
+      {showCompleteConfirm && (
+        <div style={S.modalOverlay}>
+          <div style={{...S.modalBox, background: theme.surface, borderColor: theme.border}}>
+            <div style={{...S.modalTitle, color: theme.primaryText}}>Save session?</div>
+            <div style={{...S.modalBody, color: theme.mutedText}}>Session time: <strong style={{color: theme.primaryText}}>{formatTime(sessionElapsed)}</strong>. Save your progress to history?</div>
+            <div style={S.modalActions}>
+              <button style={{...S.confirmBtn, background: T.accent, color: theme.app}} onClick={completeSession}>Save ✓</button>
+              <button style={{...S.modalCancel, color: theme.mutedText, background: theme.surfaceAlt, borderColor: theme.border}} onClick={() => setShowCompleteConfirm(false)}>Keep going</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showDiscardConfirm && (
         <div style={S.modalOverlay}>
           <div style={{...S.modalBox, background: theme.surface, borderColor: theme.border}}>
@@ -2047,7 +2726,7 @@ const S = {
   logoMark: { fontSize: 20, color: "#c8ff00" },
   logoText: { fontSize: 13, fontWeight: 700, letterSpacing: "0.18em", color: "#e8e4dc" },
   nav: { display: "flex", gap: 4 },
-  navBtn: { background: "none", border: "none", cursor: "pointer", color: "#666", fontSize: 12, fontWeight: 600, letterSpacing: "0.1em", padding: "6px 10px", borderRadius: 4 },
+  navBtn: { background: "none", border: "none", cursor: "pointer", color: "#999", fontSize: 12, fontWeight: 700, letterSpacing: "0.1em", padding: "6px 10px", borderRadius: 4 },
   navActive: { background: "#1a1a1d", border: "none", cursor: "pointer", color: "#c8ff00", fontSize: 12, letterSpacing: "0.1em", padding: "6px 10px", borderRadius: 4, fontWeight: 700 },
   main: { maxWidth: 720, margin: "0 auto", padding: "32px 20px 80px", position: "relative", zIndex: 1 },
   heroLabel: { fontSize: 10, letterSpacing: "0.25em", color: "#c8ff00", fontWeight: 700, marginBottom: 8 },
@@ -2058,37 +2737,37 @@ const S = {
   routinePlayBtn: { display: "flex", flexDirection: "column", gap: 6, padding: "16px 16px 10px", width: "100%", background: "none", border: "none", cursor: "pointer", textAlign: "left", color: "#e8e4dc" },
   routineIcon: { color: "#c8ff00", fontSize: 11 },
   routineName: { fontSize: 14, fontWeight: 700, letterSpacing: "0.05em" },
-  routineCount: { fontSize: 10, color: "#555", letterSpacing: "0.08em", fontWeight: 600 },
+  routineCount: { fontSize: 10, color: "#bbb", letterSpacing: "0.08em", fontWeight: 700 },
   routineActions: { display: "flex", borderTop: "1px solid #1e1e22" },
-  routineActionBtn: { flex: 1, background: "none", border: "none", borderRight: "1px solid #1e1e22", cursor: "pointer", color: "#555", fontSize: 11, fontWeight: 700, letterSpacing: "0.1em", padding: "8px 0", fontFamily: "'DM Mono',monospace" },
+  routineActionBtn: { flex: 1, background: "none", border: "none", borderRight: "1px solid #1e1e22", cursor: "pointer", color: "#bbb", fontSize: 11, fontWeight: 700, letterSpacing: "0.1em", padding: "8px 0", fontFamily: "'DM Mono',monospace" },
 
   renameCard: { background: "#111113", border: "1px solid #c8ff0055", borderRadius: 8, padding: "14px 12px", display: "flex", flexDirection: "column", gap: 10 },
   renameInput: { background: "transparent", border: "none", borderBottom: "1px solid #c8ff00", color: "#e8e4dc", fontSize: 14, fontWeight: 700, outline: "none", padding: "4px 0", width: "100%", fontFamily: "'DM Mono',monospace" },
   renameActions: { display: "flex", gap: 6 },
   renameSave: { background: "#c8ff00", border: "none", borderRadius: 4, color: "#0c0c0e", fontSize: 11, fontWeight: 700, padding: "5px 12px", cursor: "pointer" },
-  renameCancel: { background: "#1e1e22", border: "none", borderRadius: 4, color: "#888", fontSize: 11, padding: "5px 10px", cursor: "pointer" },
+  renameCancel: { background: "#1e1e22", border: "none", borderRadius: 4, color: "#ccc", fontSize: 11, padding: "5px 10px", cursor: "pointer" },
 
-  addRoutineCard: { background: "transparent", border: "1px dashed #333", borderRadius: 8, padding: "20px 16px", cursor: "pointer", color: "#555", display: "flex", flexDirection: "column", gap: 8, textAlign: "left" },
+  addRoutineCard: { background: "transparent", border: "1px dashed #555", borderRadius: 8, padding: "20px 16px", cursor: "pointer", color: "#bbb", display: "flex", flexDirection: "column", gap: 8, textAlign: "left" },
   addIcon: { fontSize: 18, color: "#c8ff00" },
-  addLabel: { fontSize: 13, letterSpacing: "0.05em" },
+  addLabel: { fontSize: 13, letterSpacing: "0.05em", fontWeight: 700 },
   addRoutineRow: { display: "flex", gap: 8, marginBottom: 16 },
   textInput: { flex: 1, background: "#111113", border: "1px solid #333", borderRadius: 6, padding: "10px 14px", color: "#e8e4dc", fontSize: 13, outline: "none", fontFamily: "'DM Mono',monospace" },
   confirmBtn: { background: "#c8ff00", border: "none", borderRadius: 6, padding: "10px 18px", cursor: "pointer", fontSize: 12, fontWeight: 700, color: "#0c0c0e" },
 
   recentSection: { marginTop: 40 },
-  sectionLabel: { fontSize: 10, letterSpacing: "0.25em", color: "#555", fontWeight: 700, marginBottom: 12 },
+  sectionLabel: { fontSize: 10, letterSpacing: "0.25em", color: "#bbb", fontWeight: 700, marginBottom: 12 },
   recentCard: { display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", background: "#111113", border: "1px solid #1e1e22", borderRadius: 8, padding: "14px 16px", cursor: "pointer", marginBottom: 8, textAlign: "left" },
   recentRoutine: { fontSize: 13, fontWeight: 700, color: "#e8e4dc", marginBottom: 2 },
-  recentDate: { fontSize: 11, color: "#555", fontWeight: 600 },
-  chevron: { color: "#444", fontSize: 20 },
+  recentDate: { fontSize: 11, color: "#bbb", fontWeight: 600 },
+  chevron: { color: "#888", fontSize: 20 },
 
-  templateHint: { fontSize: 11, color: "#555", lineHeight: 1.6, margin: "0 0 24px", letterSpacing: "0.03em" },
-  emptyTemplate: { color: "#444", fontSize: 13, padding: "20px 0", letterSpacing: "0.05em" },
+  templateHint: { fontSize: 11, color: "#bbb", lineHeight: 1.6, margin: "0 0 24px", letterSpacing: "0.03em" },
+  emptyTemplate: { color: "#bbb", fontSize: 13, padding: "20px 0", letterSpacing: "0.05em" },
   saveTemplateRow: { marginTop: 24 },
   saveTemplateBtn: { background: "#c8ff00", border: "none", borderRadius: 6, padding: "12px 28px", cursor: "pointer", fontSize: 12, fontWeight: 700, letterSpacing: "0.1em", color: "#0c0c0e" },
 
   categoryRow: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14 },
-  categoryLabel: { fontSize: 9, letterSpacing: "0.2em", color: "#555", fontWeight: 700, flexShrink: 0 },
+  categoryLabel: { fontSize: 9, letterSpacing: "0.2em", color: "#bbb", fontWeight: 700, flexShrink: 0 },
   categorySelect: { background: "#0c0c0e", border: "1px solid #2a2a2e", borderRadius: 4, color: "#e8e4dc", fontSize: 11, padding: "5px 10px", outline: "none", fontFamily: "'DM Mono',monospace", cursor: "pointer" },
 
   catBadgeWorking: { fontSize: 9, letterSpacing: "0.1em", background: "#111a00", color: "#c8ff00", border: "1px solid #c8ff0033", borderRadius: 3, padding: "2px 6px", flexShrink: 0 },
@@ -2096,37 +2775,37 @@ const S = {
 
   logHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 24 },
   logTitle: { fontSize: 36, fontWeight: 900, margin: "0 0 4px", fontFamily: "'Georgia',serif", color: "#e8e4dc" },
-  logDate: { fontSize: 11, color: "#555", letterSpacing: "0.1em", fontWeight: 600 },
-  prevLabel: { fontSize: 9, color: "#3a5a00", letterSpacing: "0.15em", marginTop: 4, fontWeight: 700 },
+  logDate: { fontSize: 11, color: "#bbb", letterSpacing: "0.1em", fontWeight: 600 },
+  prevLabel: { fontSize: 10, color: "#88cc00", letterSpacing: "0.15em", marginTop: 4, fontWeight: 700 },
   completeBtn: { background: "#c8ff00", border: "none", borderRadius: 6, padding: "10px 16px", cursor: "pointer", fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", color: "#0c0c0e", alignSelf: "flex-start", whiteSpace: "nowrap" },
   saveBtn: { background: "#c8ff00", border: "none", borderRadius: 6, padding: "10px 20px", cursor: "pointer", fontSize: 11, fontWeight: 700, color: "#0c0c0e", alignSelf: "flex-start" },
 
   modalOverlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 },
   modalBox: { background: "#111113", border: "1px solid #2a2a2e", borderRadius: 12, padding: "28px 24px", maxWidth: 360, width: "100%" },
   modalTitle: { fontSize: 16, fontWeight: 700, color: "#e8e4dc", marginBottom: 10, fontFamily: "'Georgia',serif" },
-  modalBody: { fontSize: 12, color: "#666", lineHeight: 1.6, marginBottom: 24 },
+  modalBody: { fontSize: 12, color: "#ccc", lineHeight: 1.6, marginBottom: 24 },
   modalActions: { display: "flex", gap: 10 },
   modalDiscard: { flex: 1, background: "#2a0000", border: "1px solid #550000", borderRadius: 6, color: "#ff6666", fontSize: 12, fontWeight: 700, padding: "10px", cursor: "pointer", letterSpacing: "0.08em" },
-  modalCancel: { flex: 1, background: "#1a1a1d", border: "1px solid #2a2a2e", borderRadius: 6, color: "#aaa", fontSize: 12, padding: "10px", cursor: "pointer" },
+  modalCancel: { flex: 1, background: "#1a1a1d", border: "1px solid #2a2a2e", borderRadius: 6, color: "#ccc", fontSize: 12, padding: "10px", cursor: "pointer" },
 
   restBanner: { background: "#111a00", border: "1px solid #c8ff0033", borderRadius: 8, padding: "12px 16px", display: "flex", alignItems: "center", gap: 12, marginBottom: 12 },
   restLabel: { fontSize: 10, letterSpacing: "0.2em", color: "#c8ff00", fontWeight: 700 },
   restTime: { fontSize: 24, fontWeight: 900, color: "#c8ff00", flex: 1 },
-  restStop: { background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: 16 },
+  restStop: { background: "none", border: "none", color: "#bbb", cursor: "pointer", fontSize: 16 },
   restButtons: { display: "flex", alignItems: "center", gap: 8, marginBottom: 24, flexWrap: "wrap" },
-  restHint: { fontSize: 10, color: "#444", fontWeight: 600, letterSpacing: "0.1em", marginRight: 4 },
+  restHint: { fontSize: 10, color: "#bbb", fontWeight: 700, letterSpacing: "0.1em", marginRight: 4 },
   restBtn: { background: "#111113", border: "1px solid #2a2a2e", borderRadius: 4, padding: "5px 10px", color: "#888", fontSize: 11, cursor: "pointer", fontFamily: "'DM Mono',monospace" },
 
   exerciseCard: { background: "#111113", border: "1px solid #1e1e22", borderRadius: 10, padding: "16px", marginBottom: 16 },
   exHeader: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10 },
   exNum: { fontSize: 11, color: "#c8ff00", fontWeight: 700, width: 24, flexShrink: 0 },
   exNameInput: { flex: 1, background: "transparent", border: "none", borderBottom: "1px solid #333", padding: "4px 0", color: "#e8e4dc", fontSize: 14, fontWeight: 700, outline: "none", fontFamily: "'DM Mono',monospace", minWidth: 0 },
-  exLogName: { flex: 1, fontSize: 14, fontWeight: 700, color: "#e8e4dc", minWidth: 0 },
+  exLogName: { flex: 1, fontSize: 14, fontWeight: 900, color: "#e8e4dc", minWidth: 0 },
   exMoveGroup: { display: "flex", gap: 2, flexShrink: 0 },
-  moveBtn: { background: "#1a1a1d", border: "none", borderRadius: 3, color: "#555", cursor: "pointer", fontSize: 11, padding: "3px 6px", fontFamily: "'DM Mono',monospace" },
+  moveBtn: { background: "#1a1a1d", border: "none", borderRadius: 3, color: "#ccc", cursor: "pointer", fontSize: 11, padding: "3px 6px", fontFamily: "'DM Mono',monospace" },
   exViewHeader: { display: "flex", alignItems: "center", gap: 8, marginBottom: 14 },
   exViewName: { fontSize: 14, fontWeight: 700, color: "#e8e4dc", flex: 1 },
-  removeBtn: { background: "none", border: "none", color: "#444", cursor: "pointer", fontSize: 14, padding: 4, flexShrink: 0 },
+  removeBtn: { background: "none", border: "none", color: "#ccc", cursor: "pointer", fontSize: 14, padding: 4, flexShrink: 0 },
 
   setHeaderRowTemplate: { display: "grid", gridTemplateColumns: "20px 1.4fr 0.5fr 0.5fr 0.7fr 20px", gap: 6, marginBottom: 6 },
   setRowTemplate: { display: "grid", gridTemplateColumns: "20px 1.4fr 0.5fr 0.5fr 0.7fr 20px", gap: 6, marginBottom: 6, alignItems: "center" },
@@ -2150,7 +2829,7 @@ const S = {
   prevRow: { display: "grid", gridTemplateColumns: "40px 0.7fr 0.7fr 0.7fr 1fr 0.8fr", gap: 6, alignItems: "center", marginBottom: 8, marginTop: 3 },
   dropSetToggleRow: { display: "flex", alignItems: "center", gap: 8, marginBottom: 12, cursor: "pointer" },
   dropSetCheckbox: { width: 14, height: 14, accentColor: "#c8ff00", cursor: "pointer", flexShrink: 0 },
-  dropSetToggleLabel: { fontSize: 11, color: "#666", letterSpacing: "0.08em" },
+  dropSetToggleLabel: { fontSize: 11, color: "#bbb", fontWeight: 700, letterSpacing: "0.08em" },
   dropSetIndent: { paddingLeft: 10 },
   suggestRowDrop: { display: "grid", gridTemplateColumns: "40px 0.7fr 0.7fr 0.7fr 1fr 0.8fr", gap: 6, alignItems: "center", marginBottom: 2, marginTop: 3 },
   suggestBadgeDrop: { fontSize: 8, color: "#ff4d9e", fontWeight: 700, letterSpacing: "0.1em", textAlign: "center" },
@@ -2170,31 +2849,31 @@ const S = {
   prevCell: { fontSize: 11, color: "#4a7a00", textAlign: "center" },
   prevCellWide: { fontSize: 10, color: "#4a7a00" },
   setHeaderRowView: { display: "grid", gridTemplateColumns: "28px 1fr 1fr 1fr 2fr", gap: 6, marginBottom: 6 },
-  setRowView: { display: "grid", gridTemplateColumns: "28px 1fr 1fr 1fr 2fr", gap: 6, marginBottom: 6, alignItems: "center" },
+  setRowView: { display: "grid", gridTemplateColumns: "36px 1fr 1fr 1fr 1fr 1fr", gap: 6, marginBottom: 4, alignItems: "center" },
 
-  setHeaderCell: { fontSize: 9, letterSpacing: "0.15em", color: "#444", fontWeight: 700 },
-  setNum: { fontSize: 11, color: "#555", textAlign: "center" },
+  setHeaderCell: { fontSize: 9, letterSpacing: "0.15em", color: "#bbb", fontWeight: 700 },
+  setNum: { fontSize: 11, color: "#bbb", textAlign: "center" },
   setInput: { background: "#0c0c0e", border: "1px solid #222", borderRadius: 4, padding: "6px 8px", color: "#e8e4dc", fontSize: 13, outline: "none", fontFamily: "'DM Mono',monospace", width: "100%", boxSizing: "border-box" },
   setInputWide: { background: "#0c0c0e", border: "1px solid #222", borderRadius: 4, padding: "6px 8px", color: "#e8e4dc", fontSize: 12, outline: "none", fontFamily: "'DM Mono',monospace", width: "100%", boxSizing: "border-box" },
-  setCell: { fontSize: 13, color: "#aaa", textAlign: "center" },
-  setCellWide: { fontSize: 12, color: "#888" },
-  setNumLabel: { display: "block", fontSize: 11, color: "#555", fontWeight: 600 },
+  setCell: { fontSize: 13, color: "#ddd", fontWeight: 700, textAlign: "center" },
+  setCellWide: { fontSize: 12, color: "#ddd", fontWeight: 700 },
+  setNumLabel: { display: "block", fontSize: 11, color: "#bbb", fontWeight: 600 },
   setCatWorking: { display: "block", fontSize: 7, letterSpacing: "0.04em", color: "#c8ff00", fontWeight: 700, marginTop: 1 },
   setCatWarmup: { display: "block", fontSize: 7, letterSpacing: "0.04em", color: "#4a9eff", fontWeight: 700, marginTop: 1 },
   setCatSelectSmall: { background: "#0c0c0e", border: "1px solid #2a2a2e", borderRadius: 4, color: "#e8e4dc", fontSize: 10, padding: "5px 6px", outline: "none", fontFamily: "'DM Mono',monospace", cursor: "pointer", width: "100%" },
-  removeSetBtn: { background: "none", border: "none", color: "#444", cursor: "pointer", fontSize: 16, padding: 0, lineHeight: 1 },
-  addSetBtn: { background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: 12, padding: "8px 0 0", letterSpacing: "0.1em" },
+  removeSetBtn: { background: "none", border: "none", color: "#aaa", cursor: "pointer", fontSize: 16, padding: 0, lineHeight: 1 },
+  addSetBtn: { background: "none", border: "none", color: "#bbb", cursor: "pointer", fontSize: 12, padding: "8px 0 0", letterSpacing: "0.1em" },
   addExBtn: { width: "100%", background: "#111113", border: "1px dashed #333", borderRadius: 8, padding: 16, cursor: "pointer", color: "#c8ff00", fontSize: 12, fontWeight: 700, letterSpacing: "0.1em", fontFamily: "'DM Mono',monospace", marginTop: 4 },
 
   historyRow: { display: "flex", alignItems: "stretch", gap: 6, marginBottom: 10 },
   historyCard: { flex: 1, display: "flex", alignItems: "center", justifyContent: "space-between", background: "#111113", border: "1px solid #1e1e22", borderRadius: 8, padding: "16px", cursor: "pointer", textAlign: "left" },
-  deleteBtn: { background: "#111113", border: "1px solid #1e1e22", borderRadius: 8, padding: "0 14px", cursor: "pointer", fontSize: 15, color: "#444", flexShrink: 0 },
+  deleteBtn: { background: "#111113", border: "1px solid #1e1e22", borderRadius: 8, padding: "0 14px", cursor: "pointer", fontSize: 15, color: "#aaa", flexShrink: 0 },
   sessionDetailHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 0 },
   deleteSessionBtn: { background: "none", border: "1px solid #2a0000", borderRadius: 6, color: "#ff6666", fontSize: 11, padding: "6px 14px", cursor: "pointer", letterSpacing: "0.08em", marginBottom: 20 },
-  historyRoutine: { fontSize: 14, fontWeight: 700, color: "#e8e4dc", marginBottom: 4 },
-  historyMeta: { fontSize: 11, color: "#555", fontWeight: 600, letterSpacing: "0.05em" },
-  backBtn: { background: "none", border: "none", color: "#666", cursor: "pointer", fontSize: 12, letterSpacing: "0.1em", padding: "0 0 20px", display: "block" },
-  empty: { color: "#444", fontSize: 14, padding: "40px 0" },
+  historyRoutine: { fontSize: 14, fontWeight: 800, color: "#e8e4dc", marginBottom: 4 },
+  historyMeta: { fontSize: 11, color: "#bbb", fontWeight: 600, letterSpacing: "0.05em" },
+  backBtn: { background: "none", border: "none", color: "#ccc", cursor: "pointer", fontSize: 12, letterSpacing: "0.1em", padding: "0 0 20px", display: "block" },
+  empty: { color: "#bbb", fontSize: 14, padding: "40px 0" },
   todayCard: { border: "1px solid", borderRadius: 12, padding: "20px", marginBottom: 16 },
   todayCardTop: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 },
   manageRoutinesBtn: { display: "block", width: "100%", border: "1px solid", borderRadius: 10, padding: "16px", cursor: "pointer", textAlign: "left", fontSize: 14, fontWeight: 700, fontFamily: "'DM Mono',monospace", marginBottom: 16, letterSpacing: "0.05em" },
@@ -2206,9 +2885,7 @@ const S = {
   scheduleSelect: { width: "100%", border: "1px solid", borderRadius: 6, padding: "10px 12px", fontSize: 13, outline: "none", fontFamily: "'DM Mono',monospace", cursor: "pointer" },
   scheduleEditBtn: { border: "1px solid", borderRadius: 6, padding: "8px 16px", fontSize: 12, cursor: "pointer", letterSpacing: "0.08em", fontFamily: "'DM Mono',monospace", marginTop: 8, flexShrink: 0 },
   scheduleStartBtn: { border: "none", borderRadius: 6, padding: "8px 18px", fontSize: 11, fontWeight: 700, cursor: "pointer", letterSpacing: "0.08em" },
-  settingsBtn: { background: "none", border: "none", cursor: "pointer", color: "#555", fontSize: 16, padding: "6px 8px", lineHeight: 1 },
-  loginBox: { border: "1px solid", borderRadius: 14, padding: "32px 28px", width: "100%", maxWidth: 360, boxSizing: "border-box" },
-  settingsTabBtn: { flex: 1, border: "1px solid", borderRadius: 6, padding: "7px 12px", cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "'DM Mono',monospace", letterSpacing: "0.06em" },
+  settingsBtn: { background: "none", border: "none", cursor: "pointer", color: "#bbb", fontSize: 16, padding: "6px 8px", lineHeight: 1 },
   themeGrid: { display: "flex", flexDirection: "row", gap: 12, flexWrap: "wrap" },
   themePresetBtn: { flex: "1 1 120px", borderRadius: 10, padding: "16px 12px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 10, alignItems: "center", transition: "border 0.15s" },
   themePreviewDots: { display: "flex", gap: 6 },
@@ -2221,21 +2898,21 @@ const S = {
   benchmarkName: { fontSize: 14, fontWeight: 700, letterSpacing: "0.05em", marginBottom: 6 },
   benchmarkStats: { display: "flex", alignItems: "center", gap: 8 },
   benchmarkStat: { display: "flex", alignItems: "baseline", gap: 4 },
-  benchmarkStatLabel: { fontSize: 9, letterSpacing: "0.15em", color: "#555", fontWeight: 700 },
+  benchmarkStatLabel: { fontSize: 9, letterSpacing: "0.15em", color: "#bbb", fontWeight: 700 },
   benchmarkStatValue: { fontSize: 16, fontWeight: 900, color: "#c8ff00" },
-  benchmarkDivider: { color: "#333", fontSize: 14 },
-  benchmarkDate: { fontSize: 10, color: "#444" },
-  benchmarkNoData: { fontSize: 11, color: "#444", letterSpacing: "0.05em" },
-  benchmarkRemoveBtn: { background: "none", border: "none", borderLeft: "1px solid #1e1e22", color: "#333", cursor: "pointer", padding: "0 16px", fontSize: 14, flexShrink: 0 },
+  benchmarkDivider: { color: "#888", fontSize: 14 },
+  benchmarkDate: { fontSize: 10, color: "#bbb", fontWeight: 700 },
+  benchmarkNoData: { fontSize: 11, color: "#bbb", letterSpacing: "0.05em" },
+  benchmarkRemoveBtn: { background: "none", border: "none", borderLeft: "1px solid #1e1e22", color: "#aaa", cursor: "pointer", padding: "0 16px", fontSize: 14, flexShrink: 0 },
   chartWrap: { padding: "4px 8px 16px", borderTop: "1px solid #1a1a1d" },
-  chartEmpty: { padding: "12px 16px 16px", fontSize: 11, color: "#444", borderTop: "1px solid #1a1a1d" },
-  diffSelect: { background: "#0c0c0e", border: "1px solid #2a2a2e", borderRadius: 4, color: "#555", fontSize: 10, padding: "5px 4px", outline: "none", fontFamily: "'DM Mono',monospace", cursor: "pointer", width: "100%" },
-  diffSelectFilled: (d) => ({ background: "#0c0c0e", border: "1px solid " + (d === "Easy" ? "#4a9eff44" : d === "Medium" ? "#c8ff0044" : d === "Difficult" ? "#ff8c0044" : "#ff444444"), borderRadius: 4, color: d === "Easy" ? "#4a9eff" : d === "Medium" ? "#c8ff00" : d === "Difficult" ? "#ff8c00" : "#ff4444", fontSize: 10, padding: "5px 4px", outline: "none", fontFamily: "'DM Mono',monospace", cursor: "pointer", width: "100%" }),
-  notesBtn: { background: "#111113", border: "1px solid #2a2a2e", borderRadius: 4, color: "#555", fontSize: 10, padding: "5px 6px", cursor: "pointer", fontFamily: "'DM Mono',monospace", overflow: "hidden", textOverflow: "ellipsis", width: "100%" },
+  chartEmpty: { padding: "12px 16px 16px", fontSize: 11, color: "#bbb", borderTop: "1px solid #1a1a1d" },
+  diffSelect: { background: "#0c0c0e", border: "1px solid #2a2a2e", borderRadius: 4, color: "#bbb", fontSize: 10, padding: "5px 4px", outline: "none", fontFamily: "'DM Mono',monospace", cursor: "pointer", width: "100%" },
+  diffSelectFilled: (d) => ({ background: "#0c0c0e", border: "1px solid " + (d === "Too Easy" ? "#aabbff44" : d === "Easy" ? "#4a9eff44" : d === "Medium" ? "#c8ff0044" : d === "Difficult" ? "#ff8c0044" : "#ff444444"), borderRadius: 4, color: d === "Too Easy" ? "#aabbff" : d === "Easy" ? "#4a9eff" : d === "Medium" ? "#c8ff00" : d === "Difficult" ? "#ff8c00" : "#ff4444", fontSize: 10, padding: "5px 4px", outline: "none", fontFamily: "'DM Mono',monospace", cursor: "pointer", width: "100%" }),
+  notesBtn: { background: "#111113", border: "1px solid #2a2a2e", borderRadius: 4, color: "#bbb", fontSize: 10, padding: "5px 6px", cursor: "pointer", fontFamily: "'DM Mono',monospace", overflow: "hidden", textOverflow: "ellipsis", width: "100%" },
   notesBtnFilled: { background: "#111a00", border: "1px solid #c8ff0044", borderRadius: 4, color: "#c8ff00", fontSize: 10, padding: "5px 6px", cursor: "pointer", fontFamily: "'DM Mono',monospace", overflow: "hidden", textOverflow: "ellipsis", width: "100%" },
   notesModalBox: { background: "#111113", border: "1px solid #2a2a2e", borderRadius: 12, padding: "28px 24px", maxWidth: 480, width: "100%" },
   notesTextarea: { width: "100%", minHeight: 160, background: "#0c0c0e", border: "1px solid #333", borderRadius: 6, color: "#e8e4dc", fontSize: 14, padding: "12px", outline: "none", fontFamily: "'DM Mono',monospace", resize: "vertical", boxSizing: "border-box", lineHeight: 1.6, marginBottom: 16 },
   addBenchmarkRow: { display: "flex", alignItems: "center", gap: 12, marginTop: 16, padding: "14px 16px", background: "#111113", border: "1px dashed #333", borderRadius: 8 },
-  addBenchmarkLabel: { fontSize: 9, letterSpacing: "0.2em", color: "#555", fontWeight: 700, flexShrink: 0 },
+  addBenchmarkLabel: { fontSize: 9, letterSpacing: "0.2em", color: "#bbb", fontWeight: 700, flexShrink: 0 },
   benchmarkSelect: { flex: 1, background: "#0c0c0e", border: "1px solid #2a2a2e", borderRadius: 4, color: "#e8e4dc", fontSize: 12, padding: "7px 10px", outline: "none", fontFamily: "'DM Mono',monospace", cursor: "pointer" },
 };
